@@ -2,9 +2,11 @@ name: Notion → Telegram notifier
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
+# Each run polls Notion every minute for LOOP_MINUTES minutes, so back-to-back
+# runs give ~1-minute notification latency around the clock.
 concurrency:
   group: notify
   cancel-in-progress: false
@@ -12,6 +14,7 @@ concurrency:
 jobs:
   notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 32
     steps:
       - uses: actions/checkout@v4
 
@@ -28,3 +31,4 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TEAM_MAP: ${{ secrets.TEAM_MAP }}
+          LOOP_MINUTES: "28"

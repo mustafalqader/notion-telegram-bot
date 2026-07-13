@@ -13,6 +13,7 @@ Required environment variables:
 import html
 import json
 import os
+import time
 from datetime import datetime
 
 import requests
@@ -132,7 +133,7 @@ def mark_notified(page_id):
     resp.raise_for_status()
 
 
-def main():
+def run_once():
     tasks = fetch_unnotified_tasks()
     notified = skipped = 0
     for page in tasks:
@@ -154,8 +155,23 @@ def main():
             skipped += 1
     print(
         f"Summary: {len(tasks)} tasks checked, "
-        f"{notified} notified, {skipped} skipped"
+        f"{notified} notified, {skipped} skipped",
+        flush=True,
     )
+
+
+def main():
+    """Poll once, or keep polling every minute for LOOP_MINUTES minutes."""
+    loop_minutes = int(os.environ.get("LOOP_MINUTES", "0"))
+    deadline = time.monotonic() + loop_minutes * 60
+    while True:
+        try:
+            run_once()
+        except Exception as exc:  # e.g. Notion outage — keep the loop alive
+            print(f"ERROR run failed: {sanitize(exc)}", flush=True)
+        if time.monotonic() + 60 > deadline:
+            return
+        time.sleep(60)
 
 
 if __name__ == "__main__":
