@@ -19,7 +19,8 @@ import requests
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TEAM_MAP = json.loads(os.environ["TEAM_MAP"])
+# utf-8-sig strips a UTF-8 BOM in case the secret was pasted from Windows
+TEAM_MAP = json.loads(os.environ["TEAM_MAP"].encode("utf-8").decode("utf-8-sig"))
 
 DATA_SOURCE_ID = "e89111c3-6385-43a4-b3d3-0d722bc29981"
 NOTION_VERSION = "2025-09-03"
