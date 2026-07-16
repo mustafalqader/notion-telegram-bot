@@ -5,8 +5,12 @@ on:
     - cron: "*/30 * * * *"
   workflow_dispatch:
 
-# Each run polls Notion every minute for LOOP_MINUTES minutes, so back-to-back
-# runs give ~1-minute notification latency around the clock.
+# GitHub throttles cron schedules heavily (observed: runs fired every 3-8 h
+# instead of every 30 min). Each run therefore polls Notion every minute for
+# ~6 hours (GitHub's max job length), so even sparse scheduling gives
+# near-continuous ~1-minute notification latency. The concurrency group keeps
+# the newest fired schedule queued until the running job ends, chaining
+# coverage back-to-back.
 concurrency:
   group: notify
   cancel-in-progress: false
@@ -14,7 +18,7 @@ concurrency:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 32
+    timeout-minutes: 358
     steps:
       - uses: actions/checkout@v4
 
@@ -31,4 +35,4 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TEAM_MAP: ${{ secrets.TEAM_MAP }}
-          LOOP_MINUTES: "28"
+          LOOP_MINUTES: "353"
