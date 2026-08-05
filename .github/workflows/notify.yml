@@ -1,9 +1,20 @@
 name: Notion → Telegram notifier
 
+# Makes forced test runs obvious in the Actions list.
+run-name: >-
+  ${{ github.event.inputs.force == 'true'
+      && 'Notifier — forced single pass'
+      || 'Notifier — polling loop' }}
+
 on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Run now: skip the queue and do a single pass (for testing)"
+        type: boolean
+        default: true
 
 # GitHub throttles cron schedules heavily (observed: runs fired every 3-8 h
 # instead of every 30 min). Each run therefore polls Notion every minute for
@@ -11,8 +22,17 @@ on:
 # near-continuous ~1-minute notification latency. The concurrency group keeps
 # the newest fired schedule queued until the running job ends, chaining
 # coverage back-to-back.
+#
+# That chaining is exactly what makes a manual test unusable: a dispatch lands
+# in the same group and sits pending for hours behind the running loop, and a
+# second dispatch evicts the first (GitHub keeps only one pending run per
+# group). A forced run therefore gets its own single-use group keyed by run id,
+# so it starts immediately and never contends with — or cancels — the loop.
 concurrency:
-  group: notify
+  group: >-
+    ${{ github.event.inputs.force == 'true'
+        && format('notify-force-{0}', github.run_id)
+        || 'notify' }}
   cancel-in-progress: false
 
 jobs:
@@ -35,4 +55,6 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TEAM_MAP: ${{ secrets.TEAM_MAP }}
-          LOOP_MINUTES: "353"
+          # A forced run does one pass and exits, so you get the log in
+          # seconds instead of holding a runner for six hours.
+          LOOP_MINUTES: ${{ github.event.inputs.force == 'true' && '0' || '353' }}
