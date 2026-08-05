@@ -1,6 +1,6 @@
-"""Notion -> Telegram task notifier + Mayadeen client portal sync.
+"""Notion -> Telegram notifier, Mayadeen portal sync, timestamps, decisions.
 
-Runs on a schedule (GitHub Actions). Each polling cycle does two jobs:
+Runs on a schedule (GitHub Actions). Each polling cycle does four jobs:
 
 1. Notifier: finds tasks in the iPlugn Tasks database that have an Assignee
    but haven't been notified yet, sends the assignee a Telegram message, then
@@ -8,10 +8,20 @@ Runs on a schedule (GitHub Actions). Each polling cycle does two jobs:
 2. Portal sync: one-way mirror into the client portal database (Mayadeen
    Productions) of every task whose Client/Project is "Mayadeen approval" —
    that select value is the only thing that shares a task with the client.
-   Mirrors only Task Name, Status, and Final Link, keyed by Source ID = main
-   task page ID. Rows whose task left "Mayadeen approval" (or was deleted)
-   are archived. The portal's "comment" field belongs to the client and is
-   never written. Client edits are never written back to the main database.
+   Mirrors only Task Name and Final Link, keyed by Source ID = main task page
+   ID; our internal Status is not shared. Rows whose task left "Mayadeen
+   approval" (or was deleted) are archived. The portal's "comment" and
+   "Client Decision" columns belong to the client and are never written.
+3. Timestamps: stamps "Delivered At" the first cycle a task has a Final Link,
+   and "Approved At" the first cycle its Status is Approved, in Asia/Baghdad
+   time. Write-once — an existing stamp is never overwritten, so re-pasting a
+   link or re-approving keeps the original date. Neither field is mirrored to
+   the client portal.
+4. Client decisions: reads "Client Decision" from portal rows and Telegrams
+   Mustafa when it changes, approving the main task on "✅ Approved". The
+   decision last pinged about is stored on the main task, so each decision
+   pings once and a changed decision pings again. This is the one place a
+   client action reaches the main database, and it only ever sets Status.
 
 Required environment variables:
     NOTION_TOKEN    Notion integration token
@@ -23,9 +33,17 @@ import html
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
+
+try:
+    from zoneinfo import ZoneInfo
+
+    BAGHDAD = ZoneInfo("Asia/Baghdad")
+except Exception:  # host without a tz database (e.g. a bare Windows box)
+    # Iraq dropped DST in 2015 and has been a flat UTC+3 since.
+    BAGHDAD = timezone(timedelta(hours=3), "Asia/Baghdad")
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -37,6 +55,17 @@ PORTAL_DATA_SOURCE_ID = "dac57661-37e6-47c9-9ac0-a8282144e197"
 # The single condition that puts a task on the client portal. Tasks tagged
 # plain "Mayadeen" stay internal.
 PORTAL_CLIENT = "Mayadeen approval"
+APPROVED_STATUS = "Approved"
+
+# Client decision handling (job 4)
+DECISION_APPROVED = "✅ Approved"
+DECISION_CHANGES = "🔁 Needs Changes"
+# Which decision we last pinged about, kept on the MAIN task. Storing it in
+# Notion rather than on disk is what makes the ping survive between runs:
+# every GitHub Actions run starts with an empty filesystem.
+DECISION_STATE_PROP = "Client Decision Notified"
+# Client decisions go to Mustafa only, not to the task's assignee.
+OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "7469972624"))
 NOTION_VERSION = "2025-09-03"
 
 NOTION_HEADERS = {
@@ -166,12 +195,12 @@ def normalize_id(value):
 
 
 def portal_payload(page):
-    """The only fields the portal mirrors. "comment" is deliberately absent —
-    it is the client's column and must never be written by the sync."""
+    """The only fields the portal mirrors. Our internal Status is not among
+    them — the client does not see our production stages. "comment" and
+    "Client Decision" belong to the client and must never be written."""
     props = page["properties"]
     return {
         "Task Name": title_text(props["Task Name"]),
-        "Status": select_name(props["Status"]),
         "Final Link": props["Final Link"].get("url"),
     }
 
@@ -180,7 +209,6 @@ def portal_current(row):
     props = row["properties"]
     return {
         "Task Name": title_text(props["Task Name"]),
-        "Status": select_name(props["Status"]),
         "Final Link": props["Final Link"].get("url"),
     }
 
@@ -191,9 +219,6 @@ def portal_properties(payload, source_id=None):
         # Notion rejects a title part with empty content, so an untitled task
         # mirrors as an empty title rather than a blank text part.
         "Task Name": {"title": [{"text": {"content": name}}] if name else []},
-        "Status": (
-            {"select": {"name": payload["Status"]}} if payload["Status"] else {"select": None}
-        ),
         "Final Link": {"url": payload["Final Link"] or None},
     }
     if source_id is not None:
@@ -324,6 +349,201 @@ def sync_portal():
     )
 
 
+# --------------------------------------------------------------------------
+# Job 3: milestone timestamps (Delivered At / Approved At)
+# --------------------------------------------------------------------------
+
+def date_start(prop):
+    date = prop.get("date")
+    return date.get("start") if date else None
+
+
+def fetch_unstamped_tasks():
+    """Tasks missing at least one milestone stamp they have earned."""
+    return query_data_source(
+        DATA_SOURCE_ID,
+        {
+            "or": [
+                {
+                    "and": [
+                        {"property": "Final Link", "url": {"is_not_empty": True}},
+                        {"property": "Delivered At", "date": {"is_empty": True}},
+                    ]
+                },
+                {
+                    "and": [
+                        {"property": "Status", "select": {"equals": APPROVED_STATUS}},
+                        {"property": "Approved At", "date": {"is_empty": True}},
+                    ]
+                },
+            ]
+        },
+    )
+
+
+def stamp_timestamps():
+    tasks = fetch_unstamped_tasks()
+    # One timestamp for the whole cycle: tasks stamped in the same pass should
+    # agree, and the drift across a single run is not meaningful.
+    now = datetime.now(BAGHDAD).isoformat(timespec="seconds")
+    delivered = approved = failed = 0
+
+    for page in tasks:
+        props = page["properties"]
+        label = title_text(props["Task Name"]) or page["id"]
+
+        # Re-check each field against the page itself. A task can match the
+        # query on one branch while the other stamp is already set, and these
+        # stamps are write-once: only ever fill a blank, so re-pasting a link
+        # or re-approving a task never resets the original time.
+        updates = {}
+        if props["Final Link"].get("url") and not date_start(props["Delivered At"]):
+            updates["Delivered At"] = {"date": {"start": now}}
+        if (
+            select_name(props["Status"]) == APPROVED_STATUS
+            and not date_start(props["Approved At"])
+        ):
+            updates["Approved At"] = {"date": {"start": now}}
+        if not updates:
+            continue
+
+        try:
+            notion_write(
+                "PATCH",
+                f"https://api.notion.com/v1/pages/{page['id']}",
+                {"properties": updates},
+            )
+            for field in updates:
+                print(f"STAMP {field} on '{label}' = {now}")
+            delivered += "Delivered At" in updates
+            approved += "Approved At" in updates
+        except Exception as exc:  # one bad task must never kill the run
+            print(f"STAMP ERROR '{label}': {sanitize(exc)}")
+            failed += 1
+
+    print(
+        f"Stamps: {len(tasks)} candidates, {delivered} Delivered At, "
+        f"{approved} Approved At, {failed} failed",
+        flush=True,
+    )
+
+
+# --------------------------------------------------------------------------
+# Job 4: client decision notifications (portal -> Telegram, Mustafa only)
+# --------------------------------------------------------------------------
+
+def fetch_page(page_id):
+    """Returns the page, or None if it is gone or in the trash."""
+    resp = requests.get(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=NOTION_HEADERS,
+        timeout=30,
+    )
+    if resp.status_code == 404:
+        return None
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Notion {resp.status_code}: {resp.text[:400]}")
+    page = resp.json()
+    if page.get("archived") or page.get("in_trash"):
+        return None
+    return page
+
+
+def build_decision_message(decision, task_name, comment, task_url):
+    name = html.escape(task_name)
+    if decision == DECISION_APPROVED:
+        lines = ["✅ الميادين وافقت | Client Approved", f"📌 {name}"]
+        if comment:
+            lines.append(f"💬 {html.escape(comment)}")
+        return "\n".join(lines)
+
+    if decision == DECISION_CHANGES:
+        header = "🔁 الميادين تطلب تعديلات | Changes Requested"
+    else:
+        # An option added in Notion that this code predates. Still worth a
+        # ping — losing the signal is worse than an unstyled message.
+        header = f"📣 قرار جديد من الميادين | {html.escape(decision)}"
+    lines = [header, f"📌 {name}"]
+    if comment:
+        lines.append(f"💬 {html.escape(comment)}")
+    lines.append(f"🔗 {task_url}")
+    return "\n".join(lines)
+
+
+def notify_client_decisions():
+    rows = query_data_source(
+        PORTAL_DATA_SOURCE_ID,
+        {"property": "Client Decision", "select": {"is_not_empty": True}},
+    )
+    sent = skipped = failed = 0
+
+    for row in rows:
+        props = row["properties"]
+        row_label = title_text(props["Task Name"]) or row["id"]
+        try:
+            decision = select_name(props["Client Decision"])
+            source_id = rich_text(props["Source ID"]).strip()
+            if not source_id:
+                print(f"DECISION SKIP '{row_label}': portal row has no Source ID")
+                skipped += 1
+                continue
+
+            task = fetch_page(source_id)
+            if task is None:
+                print(f"DECISION SKIP '{row_label}': main task {source_id} is gone")
+                skipped += 1
+                continue
+
+            state_prop = task["properties"].get(DECISION_STATE_PROP)
+            if state_prop is None:
+                raise RuntimeError(
+                    f'main database is missing the "{DECISION_STATE_PROP}" '
+                    "text property; add it so decisions can be tracked"
+                )
+
+            # Compare against the decision we last pinged about, not a simple
+            # "seen" flag: if the client switches from Needs Changes to
+            # Approved, the stored value no longer matches and it pings again.
+            if rich_text(state_prop).strip() == decision:
+                skipped += 1
+                continue
+
+            task_name = title_text(task["properties"]["Task Name"]) or row_label
+            comment = rich_text(props["comment"]).strip()
+
+            # Send first, record second. A failure between the two re-pings
+            # next cycle, which is the better failure: a duplicate message
+            # beats silently swallowing a client decision.
+            send_telegram(
+                OWNER_CHAT_ID,
+                build_decision_message(decision, task_name, comment, task["url"]),
+            )
+
+            updates = {
+                DECISION_STATE_PROP: {"rich_text": [{"text": {"content": decision}}]}
+            }
+            if decision == DECISION_APPROVED:
+                # Job 3 turns this into an "Approved At" stamp later this run.
+                updates["Status"] = {"select": {"name": APPROVED_STATUS}}
+            notion_write(
+                "PATCH",
+                f"https://api.notion.com/v1/pages/{task['id']}",
+                {"properties": updates},
+            )
+
+            print(f"DECISION SENT '{task_name}': {decision}")
+            sent += 1
+        except Exception as exc:  # one bad row must never kill the run
+            print(f"DECISION ERROR '{row_label}': {sanitize(exc)}")
+            failed += 1
+
+    print(
+        f"Decisions: {len(rows)} decided rows, {sent} notified, "
+        f"{skipped} skipped, {failed} failed",
+        flush=True,
+    )
+
+
 def run_once():
     tasks = fetch_unnotified_tasks()
     notified = skipped = 0
@@ -358,7 +578,9 @@ def main():
     while True:
         # The two jobs are independent: a Notion or Telegram outage in one
         # must not stop the other from running this cycle.
-        for job in (run_once, sync_portal):
+        # Decisions run before stamping so an approval coming back from the
+        # client gets its "Approved At" in the same cycle, not the next one.
+        for job in (run_once, sync_portal, notify_client_decisions, stamp_timestamps):
             try:
                 job()
             except Exception as exc:  # e.g. Notion outage — keep the loop alive
