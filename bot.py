@@ -57,6 +57,15 @@ PORTAL_DATA_SOURCE_ID = "dac57661-37e6-47c9-9ac0-a8282144e197"
 PORTAL_CLIENT = "Mayadeen approval"
 APPROVED_STATUS = "Approved"
 
+# Milestone stamps only apply to tasks created on or after the day this was
+# deployed. The database carries months of finished work whose Approved At is
+# empty; stamping those now would record the deploy time as the approval time,
+# and because the stamps are write-once that wrong date would be permanent.
+# Backfilling from last_edited_time was considered and rejected: most of those
+# tasks were edited long after approval, so it produces wrong data that looks
+# right. Older tasks keep empty cells, on purpose, forever.
+STAMP_EPOCH = datetime(2026, 8, 5, tzinfo=BAGHDAD)
+
 # Client decision handling (job 4)
 DECISION_APPROVED = "✅ Approved"
 DECISION_CHANGES = "🔁 Needs Changes"
@@ -358,22 +367,41 @@ def date_start(prop):
     return date.get("start") if date else None
 
 
+def created_after_epoch(page):
+    """True if the task is new enough to be stamped. Notion returns
+    created_time as UTC with a trailing Z, which fromisoformat wants as
+    +00:00 before Python 3.11."""
+    created = page["created_time"].replace("Z", "+00:00")
+    return datetime.fromisoformat(created) >= STAMP_EPOCH
+
+
 def fetch_unstamped_tasks():
-    """Tasks missing at least one milestone stamp they have earned."""
+    """Tasks created since the cutoff that are missing a stamp they earned."""
     return query_data_source(
         DATA_SOURCE_ID,
         {
-            "or": [
+            "and": [
                 {
-                    "and": [
-                        {"property": "Final Link", "url": {"is_not_empty": True}},
-                        {"property": "Delivered At", "date": {"is_empty": True}},
-                    ]
+                    "timestamp": "created_time",
+                    "created_time": {"on_or_after": STAMP_EPOCH.isoformat()},
                 },
                 {
-                    "and": [
-                        {"property": "Status", "select": {"equals": APPROVED_STATUS}},
-                        {"property": "Approved At", "date": {"is_empty": True}},
+                    "or": [
+                        {
+                            "and": [
+                                {"property": "Final Link", "url": {"is_not_empty": True}},
+                                {"property": "Delivered At", "date": {"is_empty": True}},
+                            ]
+                        },
+                        {
+                            "and": [
+                                {
+                                    "property": "Status",
+                                    "select": {"equals": APPROVED_STATUS},
+                                },
+                                {"property": "Approved At", "date": {"is_empty": True}},
+                            ]
+                        },
                     ]
                 },
             ]
@@ -386,11 +414,18 @@ def stamp_timestamps():
     # One timestamp for the whole cycle: tasks stamped in the same pass should
     # agree, and the drift across a single run is not meaningful.
     now = datetime.now(BAGHDAD).isoformat(timespec="seconds")
-    delivered = approved = failed = 0
+    delivered = approved = skipped = failed = 0
 
     for page in tasks:
         props = page["properties"]
         label = title_text(props["Task Name"]) or page["id"]
+
+        # Belt and braces on the cutoff. The stamps are write-once, so a
+        # historical task stamped by a bad filter could not be undone by
+        # rerunning anything — re-check locally before writing.
+        if not created_after_epoch(page):
+            skipped += 1
+            continue
 
         # Re-check each field against the page itself. A task can match the
         # query on one branch while the other stamp is already set, and these
@@ -422,7 +457,8 @@ def stamp_timestamps():
             failed += 1
 
     print(
-        f"Stamps: {len(tasks)} candidates, {delivered} Delivered At, "
+        f"Stamps: {len(tasks)} candidates, {skipped} pre-cutoff, "
+        f"{delivered} Delivered At, "
         f"{approved} Approved At, {failed} failed",
         flush=True,
     )

@@ -77,12 +77,22 @@ Portal: X Mayadeen approval tasks, Y created, Z updated, W archived, V failed
 
 > **إذا تريد إعادة الختم لمهمة معينة:** امسح محتوى الخانة يدوياً من Notion، والبوت راح يختمها بتاريخ جديد بالدورة الجاية.
 
+### حد زمني: المهام القديمة ما تنختم أبداً
+
+البوت **ما يختم إلا المهام المُنشأة من تاريخ 5 آب 2026 وبعده** (تاريخ التشغيل). أي مهمة أقدم من هذا التاريخ تبقى خانتها **فارغة للأبد**، حتى لو كانت `Approved`.
+
+**ليش؟** القاعدة بيها ٦٣ مهمة قديمة مكتملة وخاناتها فارغة. لو ختمها البوت، راح يسجّل تاريخ اليوم كأنه تاريخ الموافقة — والختم يصير **مرة وحدة فقط**، يعني التاريخ الغلط يبقى محفور للأبد. خانة فارغة أصدق من تاريخ مزيف.
+
+> **ملاحظة:** ما اعتمدنا `last_edited_time` لتعبئة التواريخ القديمة، لأن أغلب هذول المهام انتعدّلت بعد الموافقة بفترة — فراح تطلع بيانات غلط تبدو صحيحة، وهذا أسوأ من الفراغ.
+
+الحد الزمني مكتوب بالكود كثابت `STAMP_EPOCH` بملف `bot.py`.
+
 **هذول العمودين ما ينزامنون للبوابة** — يبقون داخليين، مثل `Script` و`Priority` وغيرهم.
 
 ملخص كل دورة بالسجل:
 
 ```
-Stamps: X candidates, Y Delivered At, Z Approved At, W failed
+Stamps: X candidates, N pre-cutoff, Y Delivered At, Z Approved At, W failed
 ```
 
 ## إشعارات قرار العميل (Client Decision)
@@ -188,7 +198,7 @@ LOOP_MINUTES: "353"         # كل مهمة تفحص كل دقيقة لمدة ~6
 Summary: X tasks checked, Y notified, Z skipped
 Portal: X Mayadeen approval tasks, Y created, Z updated, W archived, V failed
 Decisions: X decided rows, Y notified, Z skipped, W failed
-Stamps: X candidates, Y Delivered At, Z Approved At, W failed
+Stamps: X candidates, N pre-cutoff, Y Delivered At, Z Approved At, W failed
 ```
 
 الوظائف الأربع مستقلة: إذا فشلت وحدة (انقطاع Notion مثلاً)، الباقيات يكملن شغلهن بنفس الدورة.
