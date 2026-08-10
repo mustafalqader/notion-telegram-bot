@@ -103,7 +103,17 @@ def query_data_source(data_source_id, query_filter=None):
     results = []
     while True:
         resp = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=30)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # raise_for_status() reports only "400 Bad Request for url ...",
+            # which for a query is never the useful half. Notion says which
+            # part of the filter it rejected in the response body, and the
+            # filter we sent is the other half of the story — a 400 here is
+            # almost always a malformed filter, so print both.
+            raise RuntimeError(
+                f"Notion {resp.status_code} querying data source "
+                f"{data_source_id}: {resp.text[:600]}\n"
+                f"  request body: {json.dumps(body, ensure_ascii=False)[:1200]}"
+            )
         data = resp.json()
         results.extend(data["results"])
         if not data.get("has_more"):
@@ -378,32 +388,35 @@ def created_after_epoch(page):
 
 
 def fetch_unstamped_tasks():
-    """Tasks created since the cutoff that are missing a stamp they earned."""
+    """Tasks created since the cutoff that are missing a stamp they earned.
+
+    The cutoff is repeated inside both branches instead of being wrapped
+    around them. Notion allows a compound filter to nest two levels deep, and
+    and[ cutoff, or[ and[...], and[...] ] ] is three — Notion rejects the
+    whole query with a 400 and the stamp job dies every cycle. Written as
+    or[ and[...], and[...] ] it is two levels, at the cost of naming the
+    cutoff twice.
+    """
+    since = {
+        "timestamp": "created_time",
+        "created_time": {"on_or_after": STAMP_EPOCH.isoformat()},
+    }
     return query_data_source(
         DATA_SOURCE_ID,
         {
-            "and": [
+            "or": [
                 {
-                    "timestamp": "created_time",
-                    "created_time": {"on_or_after": STAMP_EPOCH.isoformat()},
+                    "and": [
+                        since,
+                        {"property": "Final Link", "url": {"is_not_empty": True}},
+                        {"property": "Delivered At", "date": {"is_empty": True}},
+                    ]
                 },
                 {
-                    "or": [
-                        {
-                            "and": [
-                                {"property": "Final Link", "url": {"is_not_empty": True}},
-                                {"property": "Delivered At", "date": {"is_empty": True}},
-                            ]
-                        },
-                        {
-                            "and": [
-                                {
-                                    "property": "Status",
-                                    "select": {"equals": APPROVED_STATUS},
-                                },
-                                {"property": "Approved At", "date": {"is_empty": True}},
-                            ]
-                        },
+                    "and": [
+                        since,
+                        {"property": "Status", "select": {"equals": APPROVED_STATUS}},
+                        {"property": "Approved At", "date": {"is_empty": True}},
                     ]
                 },
             ]
@@ -585,7 +598,18 @@ def notify_client_decisions():
             # Compare against the decision we last pinged about, not a simple
             # "seen" flag: if the client switches from Needs Changes to
             # Approved, the stored value no longer matches and it pings again.
-            if rich_text(state_prop).strip() == decision:
+            #
+            # This skip used to be the one silent path in the job, which made
+            # "2 skipped" indistinguishable from a missing Source ID or a
+            # deleted task. It prints the stored value now: if a decision is
+            # not arriving, this line says whether the bot thinks it already
+            # sent it, and what it thinks it sent.
+            notified_state = rich_text(state_prop).strip()
+            if notified_state == decision:
+                print(
+                    f"DECISION SKIP '{row_label}': already notified about "
+                    f"'{decision}'"
+                )
                 skipped += 1
                 continue
 
@@ -605,18 +629,31 @@ def notify_client_decisions():
             # a permanent Telegram error, and letting that block the state
             # write would re-ping everyone else every cycle, forever. One
             # delivery is enough to consider the decision announced; the
-            # recipient that failed is named in the log.
-            delivered = 0
+            # recipients that failed are named in the log.
+            delivered = []
+            failures = []
             for chat_id in chat_ids:
                 try:
                     send_telegram(chat_id, message)
-                    delivered += 1
+                    delivered.append(chat_id)
                 except Exception as exc:
+                    failures.append(f"{chat_id}: {sanitize(exc)}")
                     print(
                         f"DECISION ERROR '{task_name}' -> {chat_id}: {sanitize(exc)}"
                     )
+
+            # The state write below is the thing that stops this decision ever
+            # pinging again, so nothing may reach it without a message having
+            # actually left. Raising here keeps the state untouched, which is
+            # what lets the next cycle retry — recording a decision nobody
+            # received would bury it permanently.
             if not delivered:
-                raise RuntimeError("no recipient could be reached")
+                raise RuntimeError(
+                    "no recipient could be reached ("
+                    + "; ".join(failures)
+                    + f") — leaving {DECISION_STATE_PROP} unwritten so the "
+                    "next cycle retries"
+                )
 
             updates = {
                 DECISION_STATE_PROP: {"rich_text": [{"text": {"content": decision}}]}
@@ -632,7 +669,8 @@ def notify_client_decisions():
 
             print(
                 f"DECISION SENT '{task_name}': {decision} -> "
-                f"{delivered}/{len(chat_ids)} recipients"
+                f"{len(delivered)}/{len(chat_ids)} recipients "
+                f"{delivered}"
             )
             sent += 1
         except Exception as exc:  # one bad row must never kill the run
