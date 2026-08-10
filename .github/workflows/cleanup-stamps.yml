@@ -1,0 +1,72 @@
+name: Cleanup stamps (one-off)
+
+# Manual only. Defaults to a dry run, so pressing the button without reading
+# the form changes nothing.
+run-name: >-
+  ${{ github.event.inputs.apply == 'true'
+      && 'Cleanup stamps — APPLYING'
+      || 'Cleanup stamps — dry run' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which stamps to clear"
+        type: choice
+        default: stamped-at
+        options:
+          - stamped-at
+          - before-epoch
+      timestamp:
+        description: "For stamped-at: the exact value, e.g. 2026-08-11T02:48:13+03:00"
+        type: string
+        required: false
+      apply:
+        description: "Actually write. Leave unchecked to list only."
+        type: boolean
+        default: false
+
+# Never let two cleanups overlap; they write to the same rows.
+concurrency:
+  group: cleanup-stamps
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Clear stamps
+        # Inputs arrive as environment variables, never interpolated into the
+        # script body: a ${{ }} expansion is pasted in as raw text before bash
+        # sees it, so a timestamp containing shell metacharacters would run as
+        # code. Quoted "$MODE" is just a string.
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "stamped-at" ]; then
+            if [ -z "$TIMESTAMP" ]; then
+              echo "mode=stamped-at needs a timestamp input." >&2
+              exit 1
+            fi
+            SELECTOR=(--stamped-at "$TIMESTAMP")
+          else
+            SELECTOR=(--before-epoch)
+          fi
+          if [ "$APPLY" = "true" ]; then
+            SELECTOR+=(--apply)
+          fi
+          python cleanup_stamps.py "${SELECTOR[@]}"
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          MODE: ${{ inputs.mode }}
+          TIMESTAMP: ${{ inputs.timestamp }}
+          APPLY: ${{ inputs.apply }}

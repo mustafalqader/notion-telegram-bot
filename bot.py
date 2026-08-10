@@ -382,9 +382,25 @@ def date_start(prop):
 def created_after_epoch(page):
     """True if the task is new enough to be stamped. Notion returns
     created_time as UTC with a trailing Z, which fromisoformat wants as
-    +00:00 before Python 3.11."""
-    created = page["created_time"].replace("Z", "+00:00")
-    return datetime.fromisoformat(created) >= STAMP_EPOCH
+    +00:00 before Python 3.11.
+
+    Fails closed. A page with no created_time, or one that will not parse, is
+    treated as pre-cutoff and left alone: the stamps are write-once, so being
+    wrong in the permissive direction burns a permanent fake date into the
+    record, while being wrong in the strict direction only leaves a cell
+    blank until someone looks.
+
+    Note what this does *not* mean. It is the age of the Notion row, not the
+    age of the work. A task typed in today about a job finished in June is
+    "after the epoch" and will be stamped with today's date.
+    """
+    created = (page.get("created_time") or "").replace("Z", "+00:00")
+    if not created:
+        return False
+    try:
+        return datetime.fromisoformat(created) >= STAMP_EPOCH
+    except ValueError:
+        return False
 
 
 def fetch_unstamped_tasks():
@@ -439,6 +455,10 @@ def stamp_timestamps():
         # historical task stamped by a bad filter could not be undone by
         # rerunning anything — re-check locally before writing.
         if not created_after_epoch(page):
+            print(
+                f"STAMP SKIP '{label}': row created {page.get('created_time')}, "
+                f"before cutoff {STAMP_EPOCH.isoformat()}"
+            )
             skipped += 1
             continue
 
@@ -464,7 +484,13 @@ def stamp_timestamps():
                 {"properties": updates},
             )
             for field in updates:
-                print(f"STAMP {field} on '{label}' = {now}")
+                # The row's age is printed next to every stamp on purpose.
+                # These writes cannot be undone by the bot, so the log has to
+                # carry the evidence for why each one was allowed.
+                print(
+                    f"STAMP {field} on '{label}' = {now} "
+                    f"(row created {page.get('created_time')})"
+                )
             delivered += "Delivered At" in updates
             approved += "Approved At" in updates
         except Exception as exc:  # one bad task must never kill the run
