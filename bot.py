@@ -488,27 +488,25 @@ def fetch_page(page_id):
 
 
 def build_decision_message(decision, task_name, assignee_name, comment, task_url):
-    name = html.escape(task_name)
-    # These messages now land in more than one inbox, so name the owner: the
-    # assignee sees the client answered *their* task, Mustafa sees whose it is.
-    # Omitted entirely when nobody could be resolved, rather than "unassigned".
-    owner = [f"👤 {html.escape(assignee_name)}"] if assignee_name else []
-
     if decision == DECISION_APPROVED:
-        lines = ["✅ الميادين وافقت | Client Approved", f"📌 {name}", *owner]
-        if comment:
-            lines.append(f"💬 {html.escape(comment)}")
-        return "\n".join(lines)
-
-    if decision == DECISION_CHANGES:
+        header = "✅ الميادين وافقت | Client Approved"
+    elif decision == DECISION_CHANGES:
         header = "🔁 الميادين تطلب تعديلات | Changes Requested"
     else:
         # An option added in Notion that this code predates. Still worth a
         # ping — losing the signal is worse than an unstyled message.
         header = f"📣 قرار جديد من الميادين | {html.escape(decision)}"
-    lines = [header, f"📌 {name}", *owner]
+
+    lines = [header, f"📌 {html.escape(task_name)}"]
+    # These messages now land in more than one inbox, so name the owner: the
+    # assignee sees the client answered *their* task, Mustafa sees whose it is.
+    # Omitted entirely when nobody could be resolved, rather than "unassigned".
+    if assignee_name:
+        lines.append(f"👤 {html.escape(assignee_name)}")
     if comment:
         lines.append(f"💬 {html.escape(comment)}")
+    # Every decision carries the link, approvals included: they reach the
+    # editor now, and a name without a way back to the task is half a message.
     lines.append(f"🔗 {task_url}")
     return "\n".join(lines)
 

@@ -107,6 +107,7 @@ Stamps: X candidates, N pre-cutoff, Y Delivered At, Z Approved At, W failed
 📌 {اسم المهمة}
 👤 {اسم المكلّف}
 💬 {التعليق، إذا موجود}
+🔗 {رابط المهمة بالقاعدة الرئيسية}
 ```
 
 **عند طلب تعديلات:**
