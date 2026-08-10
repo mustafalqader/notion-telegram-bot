@@ -18,10 +18,11 @@ Runs on a schedule (GitHub Actions). Each polling cycle does four jobs:
    link or re-approving keeps the original date. Neither field is mirrored to
    the client portal.
 4. Client decisions: reads "Client Decision" from portal rows and Telegrams
-   Mustafa when it changes, approving the main task on "✅ Approved". The
-   decision last pinged about is stored on the main task, so each decision
-   pings once and a changed decision pings again. This is the one place a
-   client action reaches the main database, and it only ever sets Status.
+   the main task's assignee *and* Mustafa when it changes, approving the main
+   task on "✅ Approved". The decision last pinged about is stored on the main
+   task, so each decision pings once and a changed decision pings again. This
+   is the one place a client action reaches the main database, and it only
+   ever sets Status.
 
 Required environment variables:
     NOTION_TOKEN    Notion integration token
@@ -73,7 +74,8 @@ DECISION_CHANGES = "🔁 Needs Changes"
 # Notion rather than on disk is what makes the ping survive between runs:
 # every GitHub Actions run starts with an empty filesystem.
 DECISION_STATE_PROP = "Client Decision Notified"
-# Client decisions go to Mustafa only, not to the task's assignee.
+# Client decisions go to the main task's assignee and to Mustafa, who is
+# copied on every decision whether or not he owns the task.
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "7469972624"))
 NOTION_VERSION = "2025-09-03"
 
@@ -465,7 +467,7 @@ def stamp_timestamps():
 
 
 # --------------------------------------------------------------------------
-# Job 4: client decision notifications (portal -> Telegram, Mustafa only)
+# Job 4: client decision notifications (portal -> Telegram: assignee + Mustafa)
 # --------------------------------------------------------------------------
 
 def fetch_page(page_id):
@@ -485,10 +487,15 @@ def fetch_page(page_id):
     return page
 
 
-def build_decision_message(decision, task_name, comment, task_url):
+def build_decision_message(decision, task_name, assignee_name, comment, task_url):
     name = html.escape(task_name)
+    # These messages now land in more than one inbox, so name the owner: the
+    # assignee sees the client answered *their* task, Mustafa sees whose it is.
+    # Omitted entirely when nobody could be resolved, rather than "unassigned".
+    owner = [f"👤 {html.escape(assignee_name)}"] if assignee_name else []
+
     if decision == DECISION_APPROVED:
-        lines = ["✅ الميادين وافقت | Client Approved", f"📌 {name}"]
+        lines = ["✅ الميادين وافقت | Client Approved", f"📌 {name}", *owner]
         if comment:
             lines.append(f"💬 {html.escape(comment)}")
         return "\n".join(lines)
@@ -499,11 +506,51 @@ def build_decision_message(decision, task_name, comment, task_url):
         # An option added in Notion that this code predates. Still worth a
         # ping — losing the signal is worse than an unstyled message.
         header = f"📣 قرار جديد من الميادين | {html.escape(decision)}"
-    lines = [header, f"📌 {name}"]
+    lines = [header, f"📌 {name}", *owner]
     if comment:
         lines.append(f"💬 {html.escape(comment)}")
     lines.append(f"🔗 {task_url}")
     return "\n".join(lines)
+
+
+def decision_recipients(task, label):
+    """Who hears about a client decision: the main task's assignee, plus
+    Mustafa, always.
+
+    Returns (assignee_name, chat_ids). chat_ids is de-duplicated by string
+    value — TEAM_MAP may hold a chat id as a number or a string — so Mustafa
+    owning the task means one message, not two. Assignee comes first: it is
+    their task, and Mustafa is the copy. An unassigned task, or an assignee
+    missing from TEAM_MAP, falls back to Mustafa alone and says so in the log.
+    """
+    assignee_name = None
+    chat_ids = []
+
+    people = task["properties"].get("Assignee", {}).get("people", [])
+    if not people:
+        print(f"DECISION FALLBACK '{label}': main task has no assignee — owner only")
+    else:
+        assignee_id = people[0]["id"]
+        match = USER_LOOKUP.get(assignee_id)
+        if match is None:
+            print(
+                f"DECISION FALLBACK '{label}': assignee {assignee_id} "
+                "not in TEAM_MAP — owner only"
+            )
+        else:
+            assignee_name, chat_id = match
+            chat_ids.append(chat_id)
+
+    chat_ids.append(OWNER_CHAT_ID)
+
+    seen = set()
+    unique = []
+    for chat_id in chat_ids:
+        key = str(chat_id).strip()
+        if key not in seen:
+            seen.add(key)
+            unique.append(chat_id)
+    return assignee_name, unique
 
 
 def notify_client_decisions():
@@ -546,14 +593,32 @@ def notify_client_decisions():
 
             task_name = title_text(task["properties"]["Task Name"]) or row_label
             comment = rich_text(props["comment"]).strip()
+            assignee_name, chat_ids = decision_recipients(task, row_label)
+            message = build_decision_message(
+                decision, task_name, assignee_name, comment, task["url"]
+            )
 
             # Send first, record second. A failure between the two re-pings
             # next cycle, which is the better failure: a duplicate message
             # beats silently swallowing a client decision.
-            send_telegram(
-                OWNER_CHAT_ID,
-                build_decision_message(decision, task_name, comment, task["url"]),
-            )
+            #
+            # Each recipient is sent independently and one failure does not
+            # abort the rest: a teammate who never opened the bot chat returns
+            # a permanent Telegram error, and letting that block the state
+            # write would re-ping everyone else every cycle, forever. One
+            # delivery is enough to consider the decision announced; the
+            # recipient that failed is named in the log.
+            delivered = 0
+            for chat_id in chat_ids:
+                try:
+                    send_telegram(chat_id, message)
+                    delivered += 1
+                except Exception as exc:
+                    print(
+                        f"DECISION ERROR '{task_name}' -> {chat_id}: {sanitize(exc)}"
+                    )
+            if not delivered:
+                raise RuntimeError("no recipient could be reached")
 
             updates = {
                 DECISION_STATE_PROP: {"rich_text": [{"text": {"content": decision}}]}
@@ -567,7 +632,10 @@ def notify_client_decisions():
                 {"properties": updates},
             )
 
-            print(f"DECISION SENT '{task_name}': {decision}")
+            print(
+                f"DECISION SENT '{task_name}': {decision} -> "
+                f"{delivered}/{len(chat_ids)} recipients"
+            )
             sent += 1
         except Exception as exc:  # one bad row must never kill the run
             print(f"DECISION ERROR '{row_label}': {sanitize(exc)}")
