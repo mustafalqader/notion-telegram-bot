@@ -187,6 +187,26 @@ def main():
                 "'row created' value in the STAMP log lines and use "
                 "--stamped-at instead."
             )
+        else:
+            # Running this blind from the Actions tab, an empty result is
+            # indistinguishable from a mistyped timestamp. Show what is
+            # actually in the database so the right value is one glance away.
+            print(
+                f"\nNo stamp equals {args.stamped_at}. The values currently "
+                "in the database are:"
+            )
+            seen = {}
+            for page in tasks:
+                for field in STAMP_FIELDS:
+                    value = date_start(page["properties"][field])
+                    if value:
+                        seen[value] = seen.get(value, 0) + 1
+            for value, count in sorted(seen.items()):
+                print(f"  {value}  ({count} stamp(s))")
+            print(
+                "\nA bad cycle shows up as one value repeated across many "
+                "tasks. Copy it exactly."
+            )
         return
 
     for page, fields in targets:
