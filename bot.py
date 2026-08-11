@@ -1,6 +1,7 @@
 """Notion -> Telegram notifier, Mayadeen portal sync, timestamps, decisions.
 
-Runs on a schedule (GitHub Actions). Each polling cycle does four jobs:
+Runs on a schedule (GitHub Actions). Four jobs are described below; three of
+them run — job 3 is currently disabled, see main(). Each polling cycle:
 
 1. Notifier: finds tasks in the iPlugn Tasks database that have an Assignee
    but haven't been notified yet, sends the assignee a Telegram message, then
@@ -12,11 +13,13 @@ Runs on a schedule (GitHub Actions). Each polling cycle does four jobs:
    ID; our internal Status is not shared. Rows whose task left "Mayadeen
    approval" (or was deleted) are archived. The portal's "comment" and
    "Client Decision" columns belong to the client and are never written.
-3. Timestamps: stamps "Delivered At" the first cycle a task has a Final Link,
-   and "Approved At" the first cycle its Status is Approved, in Asia/Baghdad
-   time. Write-once — an existing stamp is never overwritten, so re-pasting a
-   link or re-approving keeps the original date. Neither field is mirrored to
-   the client portal.
+3. Timestamps: DISABLED, see main(). Stamps "Delivered At" the first cycle a
+   task has a Final Link, and "Approved At" the first cycle its Status is
+   Approved, in Asia/Baghdad time. Write-once — an existing stamp is never
+   overwritten, so re-pasting a link or re-approving keeps the original date.
+   Neither field is mirrored to the client portal. Turned off because its
+   cutoff cannot tell a new task from an old one entered late; both fields
+   are maintained by hand meanwhile.
 4. Client decisions: reads "Client Decision" from portal rows and Telegrams
    the main task's assignee *and* Mustafa when it changes, approving the main
    task on "✅ Approved". The decision last pinged about is stored on the main
@@ -742,11 +745,20 @@ def main():
     loop_minutes = int(os.environ.get("LOOP_MINUTES", "0"))
     deadline = time.monotonic() + loop_minutes * 60
     while True:
-        # The two jobs are independent: a Notion or Telegram outage in one
-        # must not stop the other from running this cycle.
-        # Decisions run before stamping so an approval coming back from the
-        # client gets its "Approved At" in the same cycle, not the next one.
-        for job in (run_once, sync_portal, notify_client_decisions, stamp_timestamps):
+        # The jobs are independent: a Notion or Telegram outage in one must
+        # not stop the others from running this cycle.
+        #
+        # stamp_timestamps is deliberately absent. Its cutoff compares the age
+        # of the Notion row, not the age of the work, so rows back-entered for
+        # finished jobs read as new and get stamped with the time the bot
+        # happened to see them. It wrote ten such dates on 2026-08-11 before
+        # this was caught. The stamps are write-once, so every cycle it runs
+        # costs another permanent wrong date — it stays off until the cutoff
+        # keys off something better than row age. The function is left intact;
+        # re-add it here to switch it back on. Until then "Approved At" is
+        # filled in by hand, and the bot leaves any value already present
+        # alone.
+        for job in (run_once, sync_portal, notify_client_decisions):
             try:
                 job()
             except Exception as exc:  # e.g. Notion outage — keep the loop alive
