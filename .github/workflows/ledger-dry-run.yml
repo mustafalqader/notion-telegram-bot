@@ -1,0 +1,71 @@
+name: Hours ledger (dry run)
+
+# Manual only, and it cannot write. bot.py --dry-run reads the live databases
+# and prints every row it would create or change and every Telegram message it
+# would send, then exits without taking a single write path.
+#
+# This is the workflow to run before setting LEDGER_ENABLED on the notifier.
+run-name: >-
+  ${{ github.event.inputs.as_of != ''
+      && format('Ledger dry run — as of {0}', github.event.inputs.as_of)
+      || 'Ledger dry run — now' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      as_of:
+        description: "Pretend it is this moment, e.g. 2026-09-05T09:30 (blank = now)"
+        type: string
+        required: false
+      force_report:
+        description: "Preview the Saturday report even if it is not due yet"
+        type: boolean
+        default: false
+
+# Reads only, so it cannot corrupt anything by overlapping — but two dry runs
+# at once produce interleaved logs that are unreadable, which defeats the point.
+concurrency:
+  group: ledger-dry-run
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Syntax check
+        run: python -m py_compile bot.py cleanup_stamps.py
+
+      - name: Preview the ledger
+        # Inputs arrive as environment variables and are never interpolated
+        # into the script body: a ${{ }} expansion is pasted in as raw text
+        # before bash sees it, so an as_of containing shell metacharacters
+        # would run as code. Quoted "$AS_OF" is just a string.
+        run: |
+          set -euo pipefail
+          ARGS=(--dry-run)
+          if [ -n "$AS_OF" ]; then
+            ARGS+=(--as-of "$AS_OF")
+          fi
+          if [ "$FORCE_REPORT" = "true" ]; then
+            ARGS+=(--force-report)
+          fi
+          python bot.py "${ARGS[@]}"
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TEAM_MAP: ${{ secrets.TEAM_MAP }}
+          AS_OF: ${{ inputs.as_of }}
+          FORCE_REPORT: ${{ inputs.force_report }}
+          # Left unset on purpose. The dry run does not read it, and an
+          # accidental "true" here must never be what switches the ledger on.
+          LEDGER_ENABLED: ""
