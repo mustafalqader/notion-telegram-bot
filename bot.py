@@ -28,20 +28,24 @@ see main(). Each polling cycle:
    is the one place a client action reaches the main database, and it only
    ever sets Status.
 5. Hours ledger: hourly, sums the Hours formula over each person's tasks whose
-   Deadline falls in the current week (Saturday 00:00 -> Friday 23:59 Baghdad,
-   cancelled excluded) into the Weekly Hours database, one row per person per
-   week. Everyone gets a row even at zero hours, so an empty week is visible
-   rather than missing. Running Balance chains off Notion's own Week Balance
-   formula; Capped Hours, Week Balance and Remaining are never written.
-6. Weekly report: closes the week that just ended — refreshes its numbers,
-   Telegrams each person their week and Mustafa a table of all five, then ticks
-   Locked. Locked rows are never touched again by either ledger job.
+   Deadline falls in the current half-month period (the 1st to the 15th, or the
+   16th to the last day, Baghdad; cancelled excluded) into the Hours Ledger
+   database, one row per person per period, keyed by Person + Period. Everyone
+   gets a row even at zero hours, so an empty period is visible rather than
+   missing. Actual Hours is the only number written; Remaining and Overtime
+   are Notion's formulas and are never written.
+6. Period close: when a period ends — the 16th, and the 1st of next month —
+   refreshes the finished period's numbers, Telegrams each person their period
+   and Mustafa all five in one message, then ticks Closed. It fires on the
+   condition "last period still has an open row", not on a clock instant, and
+   it sends before it closes so a failed send is retried rather than buried.
+   Closed rows are never touched again by either ledger job.
 
 Jobs 5 and 6 only run when LEDGER_ENABLED is set. Preview them against live
 data without writing or sending anything:
 
     python bot.py --dry-run
-    python bot.py --dry-run --as-of 2026-09-05T09:30 --force-report
+    python bot.py --dry-run --as-of 2026-09-16T09:30
 
 Required environment variables:
     NOTION_TOKEN    Notion integration token
@@ -100,23 +104,17 @@ DECISION_STATE_PROP = "Client Decision Notified"
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "7469972624"))
 NOTION_VERSION = "2025-09-03"
 
-# Weekly hours ledger (jobs 5 and 6)
-WEEKLY_DATA_SOURCE_ID = "729ea6ac-d3cf-49f7-9cd8-df82751119dc"
-# Computed by Notion from Actual Hours and Target. The Capped Hours rule lives
-# in the formula and is not readable from here, which is exactly why this code
-# reads Week Balance back off the row instead of recomputing it.
-LEDGER_FORMULA_PROPS = frozenset({"Capped Hours", "Week Balance", "Remaining"})
+# Half-month hours ledger (jobs 5 and 6)
+LEDGER_DATA_SOURCE_ID = "729ea6ac-d3cf-49f7-9cd8-df82751119dc"
+# Computed by Notion from Actual Hours and Target. Never sent in a write.
+LEDGER_FORMULA_PROPS = frozenset({"Remaining", "Overtime"})
 # The Status option is lowercase in the database; compared case-folded anyway.
 CANCELLED_STATUS = "cancelled"
-LEDGER_TARGET_DEFAULT = 48
-# Flat monthly figure quoted in the report, not derived from the week target.
-MONTH_TARGET = 208
-# Saturday, Baghdad. See run_weekly_report for why this is a floor, not a slot.
-REPORT_HOUR = 9
-# The week this process has already reported on, so the trigger condition is
-# only paid for once per week. Deliberately not persistence: a restarted run
-# re-checks against Notion, where Locked is the durable record.
-_reported_week = None
+LEDGER_TARGET_DEFAULT = 104
+# The period this process has already closed, so the trigger condition is only
+# paid for once. Deliberately not persistence: a restarted run re-checks
+# against Notion, where Closed is the durable record.
+_closed_period = None
 # Monotonic mark of the last successful ledger pass; see main().
 _last_ledger_run = None
 # Both ledger jobs stay out of the polling loop until this is set. They write
@@ -760,29 +758,45 @@ def notify_client_decisions():
 
 
 # --------------------------------------------------------------------------
-# Jobs 5 and 6: weekly hours ledger, and the Saturday report that closes a week
+# Jobs 5 and 6: the half-month hours ledger, and the close that ends a period
 # --------------------------------------------------------------------------
 
-def week_start_of(moment):
-    """The Saturday 00:00 Baghdad on or before `moment`.
+def period_of(moment):
+    """The half-month containing `moment`, as [start, end) Baghdad midnights.
 
-    Python's weekday() is Mon=0 .. Sat=5, Sun=6, so (weekday() - 5) % 7 is the
-    number of days back to Saturday: Saturday itself gives 0 and Friday gives 6.
+    Two periods a month: the 1st to the 15th, and the 16th to the last day.
+    The end is exclusive, so a deadline belongs to exactly one period and no
+    day is claimed by two.
     """
     local = moment.astimezone(BAGHDAD)
     midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight - timedelta(days=(local.weekday() - 5) % 7)
+    if local.day <= 15:
+        return midnight.replace(day=1), midnight.replace(day=16)
+    # The 1st of next month, reached without knowing this month's length:
+    # 32 days past the 1st always lands inside the following month.
+    next_first = (midnight.replace(day=1) + timedelta(days=32)).replace(day=1)
+    return midnight.replace(day=16), next_first
 
 
-def week_key(week_start):
-    """The Week Start value as Notion stores it: a plain YYYY-MM-DD date."""
-    return week_start.date().isoformat()
+def previous_period(start):
+    """The period immediately before the one beginning at `start`.
+
+    The day before a period's first day is the last day of the one before it,
+    so this crosses a month boundary without any month arithmetic.
+    """
+    return period_of(start - timedelta(days=1))
 
 
-def week_span(week_start):
-    """Human range for the message header, e.g. "29 Aug - 04 Sep"."""
-    friday = week_start + timedelta(days=6)
-    return f"{week_start:%d %b} - {friday:%d %b}"
+def period_label(start):
+    """The Period text a row is keyed by: "Sep 1-15" or "Sep 16-31".
+
+    The second half is written "16-31" in every month, February included. It
+    is a label, not a range — it only has to read the same here as it does in
+    the Period formula on the tasks database, because those two strings are
+    what a human lines up when checking a row. Which days are actually in the
+    period is period_of's business, and that one does know month lengths.
+    """
+    return f"{start:%b} 1-15" if start.day == 1 else f"{start:%b} 16-31"
 
 
 def parse_deadline(prop):
@@ -790,8 +804,8 @@ def parse_deadline(prop):
 
     Deadlines come in both shapes: a bare "2026-09-07" typed in the UI, and a
     full "2026-09-07T14:00:00.000+03:00" when someone sets a time. A bare date
-    is read as midnight *in Baghdad*, not UTC — otherwise a Saturday deadline
-    would land in the previous week for three hours a day.
+    is read as midnight *in Baghdad*, not UTC — otherwise a deadline on the
+    16th would land in the previous period for three hours a day.
     """
     date = prop.get("date")
     if not date or not date.get("start"):
@@ -825,40 +839,31 @@ def checkbox_value(prop):
 
 
 def target_or_default(prop):
-    """A row's Target, falling back to 48 only when it is genuinely unset.
+    """A row's Target, falling back to 104 only when it is genuinely unset.
 
     Tested against None rather than falsiness: a Target of 0 is a real value —
-    someone on leave for the week — and reporting it as 48 would tell them they
-    are 48 hours short of a target nobody set them.
+    someone on leave for the period — and reporting it as 104 would tell them
+    they are 104 hours short of a target nobody set them.
     """
     value = number_value(prop)
     return LEDGER_TARGET_DEFAULT if value is None else value
 
 
 def fmt_hours(value):
-    """48.0 -> "48", 47.5 -> "47.5". Whole hours read better without a ".0"."""
+    """104.0 -> "104", 47.5 -> "47.5". Whole hours read better without ".0"."""
     if value is None:
         return "—"
     rounded = round(float(value), 2)
     return str(int(rounded)) if rounded == int(rounded) else f"{rounded:g}"
 
 
-def fmt_balance(value):
-    """Signed, so "+6" and "-6" can never be confused at a glance."""
-    if value is None:
-        return "—"
-    if round(float(value), 2) == 0:
-        return "0"
-    return f"-{fmt_hours(abs(value))}" if value < 0 else f"+{fmt_hours(value)}"
-
-
 def ledger_write(method, url, properties, extra=None):
     """Write to the ledger, refusing to touch a formula column.
 
-    Capped Hours, Week Balance and Remaining are computed by Notion. Sending
-    any of them is a 400 at best and silent nonsense at worst, so the guard
-    raises before the request rather than after — this bot has a history of
-    writing values that could not be taken back.
+    Remaining and Overtime are computed by Notion. Sending either is a 400 at
+    best and silent nonsense at worst, so the guard raises before the request
+    rather than after — this bot has a history of writing values that could
+    not be taken back.
     """
     forbidden = LEDGER_FORMULA_PROPS.intersection(properties)
     if forbidden:
@@ -871,32 +876,33 @@ def ledger_write(method, url, properties, extra=None):
     return notion_write(method, url, body)
 
 
-def week_actuals(week_start):
-    """{notion_user_id: hours} for one week, and the count of unreadable tasks.
+def period_actuals(start, end):
+    """{notion_user_id: hours} for one period, and the count of unreadable tasks.
 
-    Sums the Hours formula over tasks whose Deadline falls in
-    [Saturday 00:00, next Saturday 00:00) Baghdad, excluding cancelled ones.
+    Sums the Hours formula over tasks whose Deadline falls in [start, end),
+    excluding cancelled ones.
 
     The Notion filter is deliberately a day wider on each side and the real
     boundary is applied locally. Notion compares datetimes in UTC, so a filter
     written in Baghdad dates clips tasks near midnight at the edges of the
-    week; fetching a little extra and bucketing here is exact.
+    period; fetching a little extra and bucketing here is exact.
 
     Hours land on the *first* assignee, matching how job 1 decides who to
     notify. A task shared between two people counts once, for its owner.
     """
-    week_end = week_start + timedelta(days=7)
     tasks = query_data_source(
         DATA_SOURCE_ID,
         {
             "and": [
                 {
                     "property": "Deadline",
-                    "date": {"on_or_after": week_key(week_start - timedelta(days=1))},
+                    "date": {
+                        "on_or_after": (start - timedelta(days=1)).date().isoformat()
+                    },
                 },
                 {
                     "property": "Deadline",
-                    "date": {"before": week_key(week_end + timedelta(days=1))},
+                    "date": {"before": (end + timedelta(days=1)).date().isoformat()},
                 },
             ]
         },
@@ -909,7 +915,7 @@ def week_actuals(week_start):
         if (select_name(props["Status"]) or "").strip().lower() == CANCELLED_STATUS:
             continue
         due = parse_deadline(props["Deadline"])
-        if due is None or not (week_start <= due < week_end):
+        if due is None or not (start <= due < end):
             continue
         people = props.get("Assignee", {}).get("people", [])
         if not people:
@@ -923,102 +929,72 @@ def week_actuals(week_start):
     return totals, unreadable
 
 
-def ledger_rows_upto(week_start):
-    """Every ledger row on or before `week_start`.
-
-    One query serves all three needs: this week's rows to upsert, earlier weeks
-    to chain the running balance from, and the same month's weeks for the
-    month-to-date figure. The ledger grows by five rows a week, so this stays
-    small for years.
-    """
+def ledger_rows_for(label):
+    """Every ledger row carrying this Period label — at most one per person."""
     return query_data_source(
-        WEEKLY_DATA_SOURCE_ID,
-        {"property": "Week Start", "date": {"on_or_before": week_key(week_start)}},
+        LEDGER_DATA_SOURCE_ID,
+        {"property": "Period", "rich_text": {"equals": label}},
     )
 
 
 def index_ledger(rows):
-    """{(person, week key): row}, ignoring rows missing either key."""
+    """{(person, period label): row}, ignoring rows missing either key."""
     indexed = {}
     for row in rows:
         props = row["properties"]
         person = select_name(props["Person"])
-        start = date_start(props["Week Start"])
-        if person and start:
-            indexed[(person, start[:10])] = row
+        label = rich_text(props["Period"]).strip()
+        if person and label:
+            indexed[(person, label)] = row
     return indexed
 
 
-def previous_running(indexed, person, week_start):
-    """The running balance carried into `week_start`, or 0 for a first week.
+def sync_period(start, end, dry_run=False):
+    """Upsert every person's row for one period and return what each holds.
 
-    Takes the most recent earlier week rather than exactly seven days back.
-    In normal operation they are the same row, because job 5 writes a row for
-    every person every week; they differ only after a gap (the bot was off for
-    a fortnight), and there carrying the last known balance forward is right
-    where treating the gap as "no history" would silently reset someone to 0.
+    Actual Hours is the only number written. Remaining and Overtime belong to
+    Notion and are read back off the row after the write, never recomputed.
+
+    A row with Closed ticked is history: it is read for its numbers and never
+    written to.
     """
-    key = week_key(week_start)
-    earlier = [
-        (wk, row)
-        for (who, wk), row in indexed.items()
-        if who == person and wk < key
-    ]
-    if not earlier:
-        return 0.0
-    _, row = max(earlier, key=lambda pair: pair[0])
-    return number_value(row["properties"]["Running Balance"]) or 0.0
-
-
-def sync_week(week_start, dry_run=False):
-    """Upsert every person's row for one week and return what each holds.
-
-    Writes Actual Hours, then reads Week Balance back off the row and uses it
-    for Running Balance. Week Balance applies the Capped Hours rule, which
-    lives in Notion and is not visible to this code — recomputing it here would
-    be guessing at the cap, so the formula stays the single source of truth.
-
-    Locked rows are read for their numbers and never written to.
-    """
-    key = week_key(week_start)
-    actuals, unreadable = week_actuals(week_start)
-    indexed = index_ledger(ledger_rows_upto(week_start))
+    label = period_label(start)
+    actuals, unreadable = period_actuals(start, end)
+    indexed = index_ledger(ledger_rows_for(label))
     entries = []
-    created = updated = locked_skips = failed = 0
+    created = updated = closed_skips = failed = 0
 
     for name, member in TEAM_MAP.items():
         actual = round(actuals.get(member["notion_user_id"], 0.0), 2)
-        row = indexed.get((name, key))
+        row = indexed.get((name, label))
         entry = {
             "name": name,
             "chat_id": member["chat_id"],
-            "week_start": week_start,
-            "span": week_span(week_start),
+            "period": label,
             "actual": actual,
             "target": float(LEDGER_TARGET_DEFAULT),
             "remaining": None,
-            "week_balance": None,
-            "running": None,
-            "locked": False,
+            "overtime": None,
+            "closed": False,
             "estimated": False,
             "action": "unchanged",
             "row_id": row["id"] if row else None,
         }
         try:
-            if row is not None and checkbox_value(row["properties"]["Locked"]):
-                # A closed week is history. Report what it says, change nothing.
+            if row is not None and checkbox_value(row["properties"]["Closed"]):
+                # A closed period is history. Report what it says, change
+                # nothing.
                 props = row["properties"]
                 entry.update(
                     actual=number_value(props["Actual Hours"]),
-                    target=number_value(props["Target"]),
+                    target=target_or_default(props["Target"]),
                     remaining=formula_number(props["Remaining"]),
-                    week_balance=formula_number(props["Week Balance"]),
-                    running=number_value(props["Running Balance"]),
-                    locked=True,
-                    action="locked",
+                    overtime=formula_number(props["Overtime"]),
+                    closed=True,
+                    action="closed",
                 )
-                print(f"LEDGER SKIP {name} {key}: row is locked")
-                locked_skips += 1
+                print(f"LEDGER SKIP {name} {label}: row is closed")
+                closed_skips += 1
                 entries.append(entry)
                 continue
 
@@ -1029,10 +1005,9 @@ def sync_week(week_start, dry_run=False):
             if dry_run:
                 # Nothing is written, so Notion's formulas still describe the
                 # old Actual Hours. Quoting them as if they were the new
-                # numbers would be a preview of the wrong week, so anything
+                # numbers would be a preview of the wrong period, so anything
                 # downstream of a value this run did not store is estimated
-                # from the plain rule and flagged — the Capped Hours cap lives
-                # in the formula and cannot be evaluated for an unstored value.
+                # from the plain rule and flagged.
                 if row is not None:
                     entry["target"] = target_or_default(row["properties"]["Target"])
                 if row is None:
@@ -1049,51 +1024,42 @@ def sync_week(week_start, dry_run=False):
                     entry["remaining"] = formula_number(
                         row["properties"]["Remaining"]
                     )
-                    entry["week_balance"] = formula_number(
-                        row["properties"]["Week Balance"]
-                    )
+                    entry["overtime"] = formula_number(row["properties"]["Overtime"])
                 else:
-                    entry["week_balance"] = round(actual - entry["target"], 2)
                     entry["remaining"] = round(max(0.0, entry["target"] - actual), 2)
+                    entry["overtime"] = round(max(0.0, actual - entry["target"]), 2)
                     entry["estimated"] = True
-                entry["running"] = round(
-                    previous_running(indexed, name, week_start)
-                    + (entry["week_balance"] or 0.0),
-                    2,
-                )
                 print(
                     f"  {name:<10} actual {fmt_hours(actual):>5} / "
-                    f"{fmt_hours(entry['target']):<3} "
-                    f"balance {fmt_balance(entry['week_balance']):>5}  "
-                    f"running {fmt_balance(entry['running']):>5}  "
+                    f"{fmt_hours(entry['target']):<4} "
+                    f"left {fmt_hours(entry['remaining']):>5}  "
+                    f"extra {fmt_hours(entry['overtime']):>5}  "
                     f"[{entry['action']}"
-                    + ("; balance estimated" if entry["estimated"] else "")
+                    + ("; formulas estimated" if entry["estimated"] else "")
                     + "]"
                 )
                 entries.append(entry)
                 continue
 
             if row is None:
-                # An untouched week must still be visible in the ledger, so a
-                # person with no tasks gets a row reading 0 rather than no row.
+                # An untouched period must still be visible in the ledger, so
+                # a person with no tasks gets a row reading 0, not no row.
                 created_row = ledger_write(
                     "POST",
                     "https://api.notion.com/v1/pages",
                     {
                         "Record": {
-                            "title": [
-                                {"text": {"content": f"{name} — {week_start:%d %b}"}}
-                            ]
+                            "title": [{"text": {"content": f"{name} — {label}"}}]
                         },
                         "Person": {"select": {"name": name}},
-                        "Week Start": {"date": {"start": key}},
+                        "Period": {"rich_text": [{"text": {"content": label}}]},
                         "Target": {"number": LEDGER_TARGET_DEFAULT},
                         "Actual Hours": {"number": actual},
                     },
                     extra={
                         "parent": {
                             "type": "data_source_id",
-                            "data_source_id": WEEKLY_DATA_SOURCE_ID,
+                            "data_source_id": LEDGER_DATA_SOURCE_ID,
                         }
                     },
                 ).json()
@@ -1107,9 +1073,9 @@ def sync_week(week_start, dry_run=False):
                     f"https://api.notion.com/v1/pages/{row['id']}",
                     {"Actual Hours": {"number": actual}},
                 )
-                # Re-read: the formulas downstream of Actual Hours are the
-                # numbers this job depends on, so take them from Notion after
-                # the write rather than from the pre-write copy.
+                # Re-read: Remaining and Overtime are computed downstream of
+                # the number just written, so take them from Notion after the
+                # write rather than from the pre-write copy.
                 row = fetch_page(row["id"]) or row
                 entry["action"] = "updated"
                 updated += 1
@@ -1117,41 +1083,27 @@ def sync_week(week_start, dry_run=False):
             props = row["properties"]
             entry["target"] = target_or_default(props["Target"])
             entry["remaining"] = formula_number(props["Remaining"])
-            entry["week_balance"] = formula_number(props["Week Balance"])
-
-            balance = entry["week_balance"]
-            if balance is None:
-                raise RuntimeError(
-                    "Week Balance came back empty — cannot chain Running Balance"
-                )
-            running = round(previous_running(indexed, name, week_start) + balance, 2)
-            entry["running"] = running
-            if number_value(props["Running Balance"]) != running:
-                ledger_write(
-                    "PATCH",
-                    f"https://api.notion.com/v1/pages/{row['id']}",
-                    {"Running Balance": {"number": running}},
-                )
+            entry["overtime"] = formula_number(props["Overtime"])
             if entry["action"] != "unchanged":
                 # Every other job in this file logs the writes it makes; a
-                # ledger that moved someone's balance and said nothing would be
+                # ledger that moved someone's hours and said nothing would be
                 # the one place a wrong number has no trail.
                 print(
-                    f"LEDGER {entry['action'].upper()} {name} {key}: actual "
+                    f"LEDGER {entry['action'].upper()} {name} {label}: actual "
                     f"{fmt_hours(actual)}/{fmt_hours(entry['target'])}, "
-                    f"balance {fmt_balance(balance)}, "
-                    f"running {fmt_balance(running)}"
+                    f"left {fmt_hours(entry['remaining'])}, "
+                    f"extra {fmt_hours(entry['overtime'])}"
                 )
             entries.append(entry)
-        except Exception as exc:  # one bad person must never kill the week
-            print(f"LEDGER ERROR {name} {key}: {sanitize(exc)}")
+        except Exception as exc:  # one bad person must never kill the period
+            print(f"LEDGER ERROR {name} {label}: {sanitize(exc)}")
             entry["action"] = "failed"
             entries.append(entry)
             failed += 1
 
     print(
-        f"Ledger{' (dry run)' if dry_run else ''}: week {key}, "
-        f"{created} created, {updated} updated, {locked_skips} locked, "
+        f"Ledger{' (dry run)' if dry_run else ''}: {label}, "
+        f"{created} created, {updated} updated, {closed_skips} closed, "
         f"{failed} failed"
         + (f", {unreadable} task(s) with unreadable Hours" if unreadable else ""),
         flush=True,
@@ -1160,113 +1112,90 @@ def sync_week(week_start, dry_run=False):
 
 
 def run_ledger(now=None, dry_run=False):
-    """Job 5: keep the current week's ledger rows current."""
-    return sync_week(week_start_of(now or datetime.now(BAGHDAD)), dry_run=dry_run)
-
-
-def month_to_date(entry, indexed):
-    """Hours logged in the calendar month containing this week's Saturday.
-
-    A week belongs to the month its Saturday falls in, so every week counts
-    once and a week straddling a month boundary is not split. MONTH_TARGET is
-    the flat monthly figure and does not vary with how many Saturdays a month
-    happens to contain.
-    """
-    week_start = entry["week_start"]
-    prefix = f"{week_start:%Y-%m}"
-    total = entry["actual"] or 0.0
-    for (who, wk), row in indexed.items():
-        if who == entry["name"] and wk.startswith(prefix) and wk != week_key(week_start):
-            total += number_value(row["properties"]["Actual Hours"]) or 0.0
-    return round(total, 2)
+    """Job 5: keep the current period's ledger rows current."""
+    start, end = period_of(now or datetime.now(BAGHDAD))
+    return sync_period(start, end, dry_run=dry_run)
 
 
 def build_person_report(entry):
-    span = html.escape(entry["span"])
-    remaining = entry["remaining"]
     lines = [
-        f"📊 تقرير الأسبوع | {span}",
+        f"📊 تقريرك | {html.escape(entry['period'])}",
         f"⏱️ ساعاتك: {fmt_hours(entry['actual'])} من {fmt_hours(entry['target'])}",
+    ]
+    remaining = entry["remaining"]
+    lines.append(
         f"⚠️ ناقصك {fmt_hours(remaining)} ساعة"
         if remaining is not None and remaining > 0
-        else "✅ كملت الهدف",
-        f"🏦 رصيدك التراكمي: {fmt_balance(entry['running'])}",
-        f"📅 الشهر: {fmt_hours(entry['month_actual'])} من {MONTH_TARGET}",
-    ]
+        else "✅ كملت الهدف"
+    )
+    overtime = entry["overtime"]
+    if overtime is not None and overtime > 0:
+        lines.append(f"💰 ساعات إضافية: {fmt_hours(overtime)}")
     return "\n".join(lines)
 
 
-def build_owner_report(entries, span):
-    """Mustafa's whole-team view, worst running balance first.
+def build_owner_report(entries, label):
+    """Mustafa's whole-team view: all five in one message, furthest behind first.
 
     Laid out as a monospace block with Latin headers: a column-aligned table
     mixing Arabic headers with Latin names and digits gets reordered by the
     bidi algorithm and the columns stop lining up.
     """
-    ordered = sorted(entries, key=lambda e: (e["running"] is None, e["running"] or 0))
+    ordered = sorted(
+        entries, key=lambda e: (e["remaining"] is None, -(e["remaining"] or 0))
+    )
     width = max([len("Name")] + [len(e["name"]) for e in ordered])
-    header = f"{'Name':<{width}}  {'Hours':>5}  {'Left':>5}  {'Balance':>7}"
+    header = f"{'Name':<{width}}  {'Hours':>5}  {'Left':>5}  {'Extra':>5}"
     body = [header, "-" * len(header)]
     for entry in ordered:
         body.append(
             f"{entry['name']:<{width}}  {fmt_hours(entry['actual']):>5}  "
-            f"{fmt_hours(entry['remaining']):>5}  {fmt_balance(entry['running']):>7}"
+            f"{fmt_hours(entry['remaining']):>5}  {fmt_hours(entry['overtime']):>5}"
         )
     table = html.escape("\n".join(body))
-    return f"📊 تقرير الفريق | {html.escape(span)}\n<pre>{table}</pre>"
+    return f"📊 تقرير الفريق | {html.escape(label)}\n<pre>{table}</pre>"
 
 
-def run_weekly_report(now=None, dry_run=False, force=False):
-    """Job 6: close the week that just ended — report it, then lock it.
+def run_period_close(now=None, dry_run=False):
+    """Job 6: close the period that just ended — report it, then tick Closed.
 
-    Fires on a condition rather than at an instant: any cycle at or after
-    Saturday 09:00 Baghdad whose previous week is not yet fully locked. The
-    schedule this bot runs on is throttled hard enough that a given minute is
-    not guaranteed to have a live runner, and a strict 09:00 check would drop
-    a whole week's report whenever it did not. Locked is both the end state
-    the report is supposed to leave behind and the flag that stops it sending
-    twice, so a missed Saturday still goes out — late, once, and correct.
+    Fires on a condition, never on a clock instant: any cycle whose previous
+    period still has a row that is not Closed. The schedule this bot runs on
+    is throttled hard enough that a given minute is not guaranteed to have a
+    live runner, and a report waiting for one would be lost whenever it did
+    not. Closed is both the end state this job leaves behind and the flag that
+    stops it sending twice, so a missed changeover still goes out — late,
+    once, and correct.
 
-    Sends before locking, deliberately. A lock that lands before a failed send
-    hides the week forever, while a send that lands before a failed lock costs
-    one duplicate next cycle. Job 4 makes the same trade for the same reason.
+    Sends before closing, deliberately. A close that lands before a failed
+    send hides the period forever, while a send that lands before a failed
+    close costs one duplicate next cycle. Job 4 makes the same trade.
     """
-    global _reported_week
+    global _closed_period
     now = now or datetime.now(BAGHDAD)
-    current = week_start_of(now)
-    if not force and now < current + timedelta(hours=REPORT_HOUR):
-        return None  # still before this Saturday's 09:00
-    last_week = current - timedelta(days=7)
-    key = week_key(last_week)
-    if _reported_week == key:
+    current_start, _ = period_of(now)
+    last_start, last_end = previous_period(current_start)
+    label = period_label(last_start)
+    if _closed_period == label:
         return None
 
-    rows = index_ledger(
-        query_data_source(
-            WEEKLY_DATA_SOURCE_ID,
-            {"property": "Week Start", "date": {"equals": key}},
-        )
-    )
-    present = [rows.get((name, key)) for name in TEAM_MAP]
+    indexed = index_ledger(ledger_rows_for(label))
+    present = [indexed.get((name, label)) for name in TEAM_MAP]
     if all(
-        row is not None and checkbox_value(row["properties"]["Locked"])
+        row is not None and checkbox_value(row["properties"]["Closed"])
         for row in present
     ):
         # Already closed — by an earlier cycle, or by hand in Notion.
         if not dry_run:
-            _reported_week = key
-        print(f"Report: week {key} already locked, nothing to send", flush=True)
+            _closed_period = label
+        print(f"Close: {label} already closed, nothing to send", flush=True)
         return None
 
-    # Refresh before freezing. Job 5 only ever touches the current week, so by
-    # Saturday morning last week's numbers are as stale as the final cycle that
-    # ran before midnight — and locking makes whatever is there permanent.
-    entries = sync_week(last_week, dry_run=dry_run)
-    indexed = index_ledger(ledger_rows_upto(last_week))
-    for entry in entries:
-        entry["month_actual"] = month_to_date(entry, indexed)
+    # Refresh before freezing. Job 5 only ever touches the current period, so
+    # at the changeover last period's numbers are as stale as the final cycle
+    # that ran before midnight — and closing makes whatever is there permanent.
+    entries = sync_period(last_start, last_end, dry_run=dry_run)
 
-    span = week_span(last_week)
     sent = failed = 0
     for entry in entries:
         message = build_person_report(entry)
@@ -1279,10 +1208,10 @@ def run_weekly_report(now=None, dry_run=False, force=False):
             send_telegram(entry["chat_id"], message)
             sent += 1
         except Exception as exc:
-            print(f"REPORT ERROR {entry['name']}: {sanitize(exc)}")
+            print(f"CLOSE ERROR {entry['name']}: {sanitize(exc)}")
             failed += 1
 
-    owner_message = build_owner_report(entries, span)
+    owner_message = build_owner_report(entries, label)
     if dry_run:
         print(f"\n--- would send team table to Mustafa ({OWNER_CHAT_ID}) ---")
         print(owner_message)
@@ -1291,54 +1220,58 @@ def run_weekly_report(now=None, dry_run=False, force=False):
             send_telegram(OWNER_CHAT_ID, owner_message)
         except Exception as exc:
             # Logged rather than retried: the individual reports have gone out
-            # and the rows are about to lock, so the table will not be resent.
-            print(f"REPORT ERROR owner table: {sanitize(exc)}")
+            # and the rows are about to close, so the table is not resent.
+            print(f"CLOSE ERROR owner table: {sanitize(exc)}")
             failed += 1
 
-    locked = 0
     if dry_run:
-        print(f"\nReport (dry run): week {key}, {sent} message(s) prepared, "
-              f"{len([e for e in entries if not e['locked']])} row(s) would lock",
-              flush=True)
-        return entries
-    if not sent:
-        # Nothing reached anybody. Leaving the rows unlocked is what makes the
-        # next cycle try again instead of burying the week.
         print(
-            f"Report: week {key} NOT locked — no message reached anyone "
+            f"Close (dry run): {label}, {sent} message(s) prepared, "
+            f"{len([e for e in entries if not e['closed']])} row(s) would close",
+            flush=True,
+        )
+        return entries
+
+    if not sent:
+        # Nothing reached anybody. Leaving the rows open is what makes the
+        # next cycle try again instead of burying the period.
+        print(
+            f"Close: {label} NOT closed — no message reached anyone "
             f"({failed} failed); retrying next cycle",
             flush=True,
         )
         return entries
 
+    closed = 0
     for entry in entries:
         # A row whose sync failed holds numbers this run could not confirm.
-        # Locking is permanent, so it is left open: a week that stays editable
-        # can be corrected by hand, while a wrong week frozen shut cannot.
-        if entry["locked"] or entry["action"] == "failed" or not entry["row_id"]:
+        # Closing is permanent, so it is left open: a period that stays
+        # editable can be corrected by hand, one frozen shut on wrong numbers
+        # cannot.
+        if entry["closed"] or entry["action"] == "failed" or not entry["row_id"]:
             continue
         try:
             ledger_write(
                 "PATCH",
                 f"https://api.notion.com/v1/pages/{entry['row_id']}",
-                {"Locked": {"checkbox": True}},
+                {"Closed": {"checkbox": True}},
             )
-            locked += 1
+            closed += 1
         except Exception as exc:
-            print(f"REPORT ERROR locking {entry['name']}: {sanitize(exc)}")
+            print(f"CLOSE ERROR closing {entry['name']}: {sanitize(exc)}")
             failed += 1
 
     # Set even when some rows stayed open, so a stuck row cannot make this
-    # process re-send the whole team's report every minute for six hours. The
-    # names below are the ones to look at by hand.
-    _reported_week = key
+    # process re-send the whole team's report every minute. The names below
+    # are the ones to look at by hand.
+    _closed_period = label
     open_rows = [
         entry["name"]
         for entry in entries
-        if not entry["locked"] and entry["action"] == "failed"
+        if not entry["closed"] and entry["action"] == "failed"
     ]
     print(
-        f"Report: week {key} closed, {sent} sent, {locked} locked, {failed} failed"
+        f"Close: {label} closed, {sent} sent, {closed} ticked, {failed} failed"
         + (f", left open for {', '.join(open_rows)}" if open_rows else ""),
         flush=True,
     )
@@ -1372,37 +1305,32 @@ def run_once():
     )
 
 
-def preview(as_of=None, force_report=False):
+def preview(as_of=None):
     """One no-write pass over jobs 5 and 6, printing what they would do.
 
-    Reads the live database — the numbers below are real — but takes no write
-    path and sends no message. Row creation cannot show a true Week Balance,
-    since the formula belongs to a row that does not exist yet; those lines are
-    marked as estimates.
+    Reads the live databases — the numbers below are real — but takes no write
+    path and sends no message. A row that does not exist yet cannot show true
+    Remaining and Overtime, since those formulas belong to a row Notion has
+    not created; those lines are marked as estimates.
     """
     now = as_of or datetime.now(BAGHDAD)
+    start, _ = period_of(now)
     print(
-        f"DRY RUN at {now:%Y-%m-%d %H:%M %Z} — current week starts "
-        f"{week_key(week_start_of(now))}. Nothing is written or sent.\n"
+        f"DRY RUN at {now:%Y-%m-%d %H:%M %Z} — current period is "
+        f"{period_label(start)}. Nothing is written or sent.\n"
     )
     run_ledger(now=now, dry_run=True)
     print()
-    trigger = week_start_of(now) + timedelta(hours=REPORT_HOUR)
-    if now < trigger and not force_report:
-        print(
-            f"Report: not due — this week's trigger is {trigger:%a %d %b %H:%M}. "
-            "Re-run with --force-report to preview it anyway."
-        )
-        return
-    # Anything else the report decides (already locked, or a full preview) it
-    # explains in its own log lines.
-    run_weekly_report(now=now, dry_run=True, force=force_report)
+    # There is always a previous period, so the close is always "due"; whether
+    # it has anything to do (already closed, or a full preview) it says in its
+    # own log lines.
+    run_period_close(now=now, dry_run=True)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Notion -> Telegram notifier. With no arguments it runs "
-        "the polling loop; --dry-run previews the weekly hours ledger."
+        "the polling loop; --dry-run previews the hours ledger."
     )
     parser.add_argument(
         "--dry-run",
@@ -1412,20 +1340,14 @@ def parse_args(argv=None):
     parser.add_argument(
         "--as-of",
         metavar="ISO",
-        help="Pretend it is this moment, e.g. 2026-09-05T09:30. Dry run only.",
-    )
-    parser.add_argument(
-        "--force-report",
-        action="store_true",
-        help="Preview the Saturday report even when it is not due. Dry run only.",
+        help="Pretend it is this moment, e.g. 2026-09-16T09:30. Dry run only.",
     )
     args = parser.parse_args(argv)
-    # Both simulation switches are pinned to --dry-run on purpose. The live
-    # report is meant to be driven by its condition and nothing else; a flag
-    # that could fire it early is a flag that can lock a week that is still
-    # being worked.
-    if (args.as_of or args.force_report) and not args.dry_run:
-        parser.error("--as-of and --force-report may only be used with --dry-run")
+    # Pinned to --dry-run on purpose. The live close is meant to be driven by
+    # its condition and nothing else; a switch that could move the clock is a
+    # switch that can close a period people are still working.
+    if args.as_of and not args.dry_run:
+        parser.error("--as-of may only be used with --dry-run")
     if args.as_of:
         try:
             moment = datetime.fromisoformat(args.as_of)
@@ -1444,7 +1366,7 @@ def main():
     global _last_ledger_run
     args = parse_args()
     if args.dry_run:
-        preview(as_of=args.as_of, force_report=args.force_report)
+        preview(as_of=args.as_of)
         return
     loop_minutes = int(os.environ.get("LOOP_MINUTES", "0"))
     deadline = time.monotonic() + loop_minutes * 60
@@ -1481,13 +1403,13 @@ def main():
                     _last_ledger_run = now_mono
                 except Exception as exc:
                     print(f"ERROR run_ledger failed: {sanitize(exc)}", flush=True)
-            # Checked every cycle, but it costs nothing until Saturday 09:00
-            # and nothing again once the week is locked, so the report lands in
-            # the first minute the runner is alive after it comes due.
+            # Checked every cycle. Once the last period is closed it costs one
+            # query and stops, so the report lands in the first minute a runner
+            # is alive after the period ends — the 16th, or the 1st.
             try:
-                run_weekly_report()
+                run_period_close()
             except Exception as exc:
-                print(f"ERROR run_weekly_report failed: {sanitize(exc)}", flush=True)
+                print(f"ERROR run_period_close failed: {sanitize(exc)}", flush=True)
 
         if time.monotonic() + 60 > deadline:
             return

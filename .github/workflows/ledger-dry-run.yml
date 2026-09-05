@@ -14,13 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       as_of:
-        description: "Pretend it is this moment, e.g. 2026-09-05T09:30 (blank = now)"
+        description: "Pretend it is this moment, e.g. 2026-09-16T09:30 (blank = now)"
         type: string
         required: false
-      force_report:
-        description: "Preview the Saturday report even if it is not due yet"
-        type: boolean
-        default: false
 
 # Reads only, so it cannot corrupt anything by overlapping — but two dry runs
 # at once produce interleaved logs that are unreadable, which defeats the point.
@@ -56,16 +52,12 @@ jobs:
           if [ -n "$AS_OF" ]; then
             ARGS+=(--as-of "$AS_OF")
           fi
-          if [ "$FORCE_REPORT" = "true" ]; then
-            ARGS+=(--force-report)
-          fi
           python bot.py "${ARGS[@]}"
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TEAM_MAP: ${{ secrets.TEAM_MAP }}
           AS_OF: ${{ inputs.as_of }}
-          FORCE_REPORT: ${{ inputs.force_report }}
           # Left unset on purpose. The dry run does not read it, and an
           # accidental "true" here must never be what switches the ledger on.
           LEDGER_ENABLED: ""

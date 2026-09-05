@@ -58,8 +58,10 @@ jobs:
           # A forced run does one pass and exits, so you get the log in
           # seconds instead of holding a runner for six hours.
           LOOP_MINUTES: ${{ github.event.inputs.force == 'true' && '0' || '353' }}
-          # Jobs 5 and 6 (weekly hours ledger + Saturday report) are off until
+          # Jobs 5 and 6 (half-month hours ledger + period close) are off until
           # this is uncommented. Run the "Hours ledger (dry run)" workflow and
           # read its output first — switching this on starts writing to the
-          # Weekly Hours database and messaging all five people.
+          # Hours Ledger database and messaging all five people. The close
+          # fires on a condition, not a clock, so the first enabled run will
+          # also close and report the period that has already ended.
           # LEDGER_ENABLED: "true"
