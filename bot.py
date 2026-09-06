@@ -29,8 +29,9 @@ see main(). Each polling cycle:
    ever sets Status.
 5. Hours ledger: hourly, sums the Hours formula over each person's tasks whose
    Deadline falls in the current half-month period (the 1st to the 15th, or the
-   16th to the last day, Baghdad; cancelled excluded) into the Hours Ledger
-   database, one row per person per period, keyed by Person + Period. Everyone
+   16th to the last day, Baghdad) and whose Status is Review or Approved, into
+   the Hours Ledger database, one row per person per period, keyed by
+   Person + Period. New and In Progress tasks count 0 until they move. Everyone
    gets a row even at zero hours, so an empty period is visible rather than
    missing. Actual Hours is the only number written; Remaining and Overtime
    are Notion's formulas and are never written.
@@ -108,8 +109,11 @@ NOTION_VERSION = "2025-09-03"
 LEDGER_DATA_SOURCE_ID = "729ea6ac-d3cf-49f7-9cd8-df82751119dc"
 # Computed by Notion from Actual Hours and Target. Never sent in a write.
 LEDGER_FORMULA_PROPS = frozenset({"Remaining", "Overtime"})
-# The Status option is lowercase in the database; compared case-folded anyway.
-CANCELLED_STATUS = "cancelled"
+# Only work that reached the client counts toward the ledger. A task still in
+# New or In Progress contributes 0 hours until it moves — it is not skipped or
+# flagged, it simply is not work yet. Compared case-folded because the database
+# mixes cases across its Status options ("Review", "cancelled").
+COUNTED_STATUSES = frozenset({"review", "approved"})
 LEDGER_TARGET_DEFAULT = 104
 # The period this process has already closed, so the trigger condition is only
 # paid for once. Deliberately not persistence: a restarted run re-checks
@@ -879,8 +883,11 @@ def ledger_write(method, url, properties, extra=None):
 def period_actuals(start, end):
     """{notion_user_id: hours} for one period, and the count of unreadable tasks.
 
-    Sums the Hours formula over tasks whose Deadline falls in [start, end),
-    excluding cancelled ones.
+    Sums the Hours formula over tasks whose Deadline falls in [start, end)
+    and whose Status is Review or Approved. Anything else — New, In Progress,
+    cancelled — contributes nothing, so a person's hours climb only as their
+    work reaches the client, and an untouched task in the period reads as 0
+    rather than as time already earned.
 
     The Notion filter is deliberately a day wider on each side and the real
     boundary is applied locally. Notion compares datetimes in UTC, so a filter
@@ -912,7 +919,7 @@ def period_actuals(start, end):
     unreadable = 0
     for page in tasks:
         props = page["properties"]
-        if (select_name(props["Status"]) or "").strip().lower() == CANCELLED_STATUS:
+        if (select_name(props["Status"]) or "").strip().lower() not in COUNTED_STATUSES:
             continue
         due = parse_deadline(props["Deadline"])
         if due is None or not (start <= due < end):
