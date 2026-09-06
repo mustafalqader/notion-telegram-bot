@@ -46,6 +46,10 @@ see main(). Each polling cycle:
    it sends before it closes so a failed send is retried rather than buried.
    Closed rows are never touched again by either ledger job.
 
+Both ledger jobs ignore every period ending before LEDGER_START, so the
+database's months of older work are never created, closed, reported or
+carried from. Sep 1-15 2026 is the first live period and carries in 0.
+
 Jobs 5 and 6 only run when LEDGER_ENABLED is set. Preview them against live
 data without writing or sending anything:
 
@@ -125,6 +129,18 @@ COUNTED_STATUSES = frozenset({"review", "approved"})
 # Written to Base Target on create. The Target a person is actually judged
 # against is this plus whatever they carried in, and Notion computes that.
 LEDGER_BASE_TARGET = 104
+
+# Nothing before this exists as far as the ledger is concerned. A period that
+# ends earlier is never created, never closed, never reported and never
+# carried from — the database holds months of finished work, and the close
+# fires on a condition rather than a clock, so without this the first enabled
+# run would reach back and message five people about a period that ended weeks
+# ago.
+#
+# A period's *end* is compared, not its start, and the end is exclusive. So the
+# first live period is Sep 1-15, which ends at Sep 16 00:00; Aug 16-31, ending
+# at Sep 1, is out. Move this date to move the whole boundary.
+LEDGER_START = datetime(2026, 9, 16, tzinfo=BAGHDAD)
 # The period this process has already closed, so the trigger condition is only
 # paid for once. Deliberately not persistence: a restarted run re-checks
 # against Notion, where Closed is the durable record.
@@ -813,6 +829,16 @@ def period_label(start):
     return f"{start:%b} 1-15" if start.day == 1 else f"{start:%b} 16-31"
 
 
+def period_is_live(end):
+    """True if a period falls inside the ledger's history.
+
+    Takes the period's exclusive end, so the boundary sits between two whole
+    periods and never cuts one in half: Sep 1-15 ends at Sep 16 00:00 and is
+    live, Aug 16-31 ends at Sep 1 and is not.
+    """
+    return end >= LEDGER_START
+
+
 def parse_deadline(prop):
     """A Deadline as an aware Baghdad datetime, or None if unset/unparseable.
 
@@ -1011,7 +1037,19 @@ def sync_period(start, end, dry_run=False):
     written to.
     """
     label = period_label(start)
-    prev_label = period_label(previous_period(start)[0])
+    if not period_is_live(end):
+        # Before the ledger existed. Returning no entries is what stops the
+        # caller writing a row, sending a report or closing anything.
+        print(
+            f"Ledger: {label} ends before the ledger start "
+            f"({LEDGER_START:%d %b %Y}) — nothing to do",
+            flush=True,
+        )
+        return []
+
+    prev_start, prev_end = previous_period(start)
+    prev_label = period_label(prev_start)
+    prev_is_live = period_is_live(prev_end)
     actuals, unreadable = period_actuals(start, end)
     indexed = index_ledger(ledger_rows_for(label))
     # The previous period's rows, needed only to read Carry-out off them when
@@ -1019,6 +1057,22 @@ def sync_period(start, end, dry_run=False):
     # on the hourly passes that create nothing — which is all of them but the
     # first of each period.
     prev_indexed = None
+
+    def carry_in_for(person):
+        """What `person` carries into this period: the previous period's
+        Carry-out, or 0 when that period is outside the ledger's history.
+
+        The first live period carries in 0 for everyone by construction, which
+        is the point of the start date — no shortfall is inherited from work
+        the ledger never tracked.
+        """
+        nonlocal prev_indexed
+        if not prev_is_live:
+            return 0.0
+        if prev_indexed is None:
+            prev_indexed = index_ledger(ledger_rows_for(prev_label))
+        return carry_out_of(prev_indexed.get((person, prev_label)))
+
     entries = []
     created = updated = closed_skips = failed = 0
 
@@ -1078,11 +1132,7 @@ def sync_period(start, end, dry_run=False):
                     # period's row, which does exist. Only this row's own
                     # formulas are out of reach, so the target is quoted as
                     # the sum they would be given.
-                    if prev_indexed is None:
-                        prev_indexed = index_ledger(ledger_rows_for(prev_label))
-                    entry["carry_in"] = carry_out_of(
-                        prev_indexed.get((name, prev_label))
-                    )
+                    entry["carry_in"] = carry_in_for(name)
                     entry["target"] = LEDGER_BASE_TARGET + entry["carry_in"]
                     entry["action"] = "would create"
                     created += 1
@@ -1123,9 +1173,7 @@ def sync_period(start, end, dry_run=False):
                 # period's Carry-out is read here and nowhere else. A person
                 # with no previous row — a new hire, or the first period the
                 # ledger ever ran — starts clean at 0.
-                if prev_indexed is None:
-                    prev_indexed = index_ledger(ledger_rows_for(prev_label))
-                carry_in = carry_out_of(prev_indexed.get((name, prev_label)))
+                carry_in = carry_in_for(name)
                 created_row = ledger_write(
                     "POST",
                     "https://api.notion.com/v1/pages",
@@ -1270,6 +1318,20 @@ def run_period_close(now=None, dry_run=False):
     last_start, last_end = previous_period(current_start)
     label = period_label(last_start)
     if _closed_period == label:
+        return None
+
+    if not period_is_live(last_end):
+        # Outside the ledger's history. Reuses the same memo as an already
+        # closed period so this is said once per process rather than every
+        # minute for however long the start date is still in the future — and
+        # so nothing below runs: no query, no rows, no messages.
+        if not dry_run:
+            _closed_period = label
+        print(
+            f"Close: {label} ends before the ledger start "
+            f"({LEDGER_START:%d %b %Y}) — nothing to close",
+            flush=True,
+        )
         return None
 
     indexed = index_ledger(ledger_rows_for(label))
