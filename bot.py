@@ -36,7 +36,9 @@ see main(). Each polling cycle:
    missing. A new row carries in the previous period's Carry-out, so a
    shortfall follows a person into the next period and raises their Target;
    a surplus does not carry, because overtime is paid rather than banked.
-   The bot writes Actual Hours, and Base Target and Carry-in once at creation.
+   The bot writes Actual Hours, and Base Target (from PERSON_TARGETS, default
+   104) and Carry-in once at creation — never again, since both are columns
+   people edit by hand.
    Target, Remaining, Overtime, Carry-out and التقدم are Notion's formulas and
    are never written.
 6. Period close: when a period ends — the 16th, and the 1st of next month —
@@ -129,6 +131,9 @@ COUNTED_STATUSES = frozenset({"review", "approved"})
 # Written to Base Target on create. The Target a person is actually judged
 # against is this plus whatever they carried in, and Notion computes that.
 LEDGER_BASE_TARGET = 104
+# Overrides for anyone whose base target is not the standard one. Keyed by the
+# TEAM_MAP name, which is also the Person select value on the row.
+PERSON_TARGETS = {"Mustafa": 52}
 
 # Nothing before this exists as far as the ledger is concerned. A period that
 # ends earlier is never created, never closed, never reported and never
@@ -829,6 +834,17 @@ def period_label(start):
     return f"{start:%b} 1-15" if start.day == 1 else f"{start:%b} 16-31"
 
 
+def base_target_for(person):
+    """The Base Target to stamp on a person's brand new row.
+
+    Consulted at creation and nowhere else. An existing row's Base Target is
+    never rewritten — it is a column edited by hand, and a lookup that
+    reasserted itself every hour would silently undo those edits the next
+    time the bot ran.
+    """
+    return PERSON_TARGETS.get(person, LEDGER_BASE_TARGET)
+
+
 def period_is_live(end):
     """True if a period falls inside the ledger's history.
 
@@ -890,6 +906,11 @@ def target_of(props):
     Base Target is tested against None rather than falsiness, because 0 is a
     real value — someone on leave for the period — and reading it as 104 would
     tell them they are 104 hours short of a target nobody set them.
+
+    An empty Base Target reads as the flat 104, not as that person's
+    PERSON_TARGETS entry. This mirrors the Notion formula, which defaults an
+    empty cell to 104 for everybody — the per-person figure is what gets
+    stamped on a new row, not what an empty one means afterwards.
     """
     target = formula_number(props["Target"])
     if target is not None:
@@ -1084,7 +1105,7 @@ def sync_period(start, end, dry_run=False):
             "chat_id": member["chat_id"],
             "period": label,
             "actual": actual,
-            "target": float(LEDGER_BASE_TARGET),
+            "target": float(base_target_for(name)),
             "carry_in": 0.0,
             "remaining": None,
             "overtime": None,
@@ -1133,7 +1154,7 @@ def sync_period(start, end, dry_run=False):
                     # formulas are out of reach, so the target is quoted as
                     # the sum they would be given.
                     entry["carry_in"] = carry_in_for(name)
-                    entry["target"] = LEDGER_BASE_TARGET + entry["carry_in"]
+                    entry["target"] = base_target_for(name) + entry["carry_in"]
                     entry["action"] = "would create"
                     created += 1
                 elif stored_actual != actual:
@@ -1183,7 +1204,7 @@ def sync_period(start, end, dry_run=False):
                         },
                         "Person": {"select": {"name": name}},
                         "Period": {"rich_text": [{"text": {"content": label}}]},
-                        "Base Target": {"number": LEDGER_BASE_TARGET},
+                        "Base Target": {"number": base_target_for(name)},
                         "Carry-in": {"number": carry_in},
                         "Actual Hours": {"number": actual},
                     },
