@@ -33,8 +33,12 @@ see main(). Each polling cycle:
    the Hours Ledger database, one row per person per period, keyed by
    Person + Period. New and In Progress tasks count 0 until they move. Everyone
    gets a row even at zero hours, so an empty period is visible rather than
-   missing. Actual Hours is the only number written; Remaining and Overtime
-   are Notion's formulas and are never written.
+   missing. A new row carries in the previous period's Carry-out, so a
+   shortfall follows a person into the next period and raises their Target;
+   a surplus does not carry, because overtime is paid rather than banked.
+   The bot writes Actual Hours, and Base Target and Carry-in once at creation.
+   Target, Remaining, Overtime, Carry-out and التقدم are Notion's formulas and
+   are never written.
 6. Period close: when a period ends — the 16th, and the 1st of next month —
    refreshes the finished period's numbers, Telegrams each person their period
    and Mustafa all five in one message, then ticks Closed. It fires on the
@@ -107,14 +111,20 @@ NOTION_VERSION = "2025-09-03"
 
 # Half-month hours ledger (jobs 5 and 6)
 LEDGER_DATA_SOURCE_ID = "729ea6ac-d3cf-49f7-9cd8-df82751119dc"
-# Computed by Notion from Actual Hours and Target. Never sent in a write.
-LEDGER_FORMULA_PROPS = frozenset({"Remaining", "Overtime"})
+# Computed by Notion. Never sent in a write. Target is among them now: it is
+# Base Target + Carry-in, so the bot writes those two operands and lets Notion
+# do the sum.
+LEDGER_FORMULA_PROPS = frozenset(
+    {"Target", "Remaining", "Overtime", "Carry-out", "التقدم"}
+)
 # Only work that reached the client counts toward the ledger. A task still in
 # New or In Progress contributes 0 hours until it moves — it is not skipped or
 # flagged, it simply is not work yet. Compared case-folded because the database
 # mixes cases across its Status options ("Review", "cancelled").
 COUNTED_STATUSES = frozenset({"review", "approved"})
-LEDGER_TARGET_DEFAULT = 104
+# Written to Base Target on create. The Target a person is actually judged
+# against is this plus whatever they carried in, and Notion computes that.
+LEDGER_BASE_TARGET = 104
 # The period this process has already closed, so the trigger condition is only
 # paid for once. Deliberately not persistence: a restarted run re-checks
 # against Notion, where Closed is the durable record.
@@ -842,15 +852,43 @@ def checkbox_value(prop):
     return bool((prop or {}).get("checkbox"))
 
 
-def target_or_default(prop):
-    """A row's Target, falling back to 104 only when it is genuinely unset.
+def target_of(props):
+    """A row's Target: Base Target + Carry-in, as Notion computed it.
 
-    Tested against None rather than falsiness: a Target of 0 is a real value —
-    someone on leave for the period — and reporting it as 104 would tell them
-    they are 104 hours short of a target nobody set them.
+    Falls back to that same sum taken from the row's own two number columns,
+    but only when Notion returned nothing for the formula — "ساعاتك: 97 من —"
+    helps nobody, and both operands are sitting right there on the row. That
+    is the whole of this fallback: no other formula is ever reconstructed
+    locally, Carry-out least of all.
+
+    Base Target is tested against None rather than falsiness, because 0 is a
+    real value — someone on leave for the period — and reading it as 104 would
+    tell them they are 104 hours short of a target nobody set them.
     """
-    value = number_value(prop)
-    return LEDGER_TARGET_DEFAULT if value is None else value
+    target = formula_number(props["Target"])
+    if target is not None:
+        return target
+    base = number_value(props["Base Target"])
+    base = LEDGER_BASE_TARGET if base is None else base
+    return base + (number_value(props["Carry-in"]) or 0.0)
+
+
+def carry_out_of(row):
+    """What a row hands to the next period, or 0 when there is no such row.
+
+    Read exactly as Notion computed it and never recomputed here. Two rules
+    live inside that formula and are invisible from this side: a surplus does
+    not carry (overtime is paid, not banked), and ticking "Reset Carry"
+    forgives the shortfall. Working the number out locally would quietly
+    break both — the same reason the old weekly ledger read Week Balance back
+    off the row instead of deriving it.
+
+    An unreadable formula carries 0. Of the two ways to be wrong, inventing a
+    debt someone then has to argue their way out of is the worse one.
+    """
+    if row is None:
+        return 0.0
+    return formula_number(row["properties"]["Carry-out"]) or 0.0
 
 
 def fmt_hours(value):
@@ -959,15 +997,28 @@ def index_ledger(rows):
 def sync_period(start, end, dry_run=False):
     """Upsert every person's row for one period and return what each holds.
 
-    Actual Hours is the only number written. Remaining and Overtime belong to
-    Notion and are read back off the row after the write, never recomputed.
+    Writes three numbers and only these: Actual Hours on every pass, plus Base
+    Target and Carry-in at the moment a row is created. Target, Remaining,
+    Overtime, Carry-out and التقدم belong to Notion and are read back off the
+    row after the write, never recomputed.
+
+    Carry-in is set once, at creation, from the previous period's Carry-out.
+    It is deliberately not refreshed afterwards: the previous period is closed
+    by then, and a carry that moved under someone mid-period would make the
+    target they were working toward change beneath them.
 
     A row with Closed ticked is history: it is read for its numbers and never
     written to.
     """
     label = period_label(start)
+    prev_label = period_label(previous_period(start)[0])
     actuals, unreadable = period_actuals(start, end)
     indexed = index_ledger(ledger_rows_for(label))
+    # The previous period's rows, needed only to read Carry-out off them when
+    # a row has to be created. Fetched at most once per pass, and not at all
+    # on the hourly passes that create nothing — which is all of them but the
+    # first of each period.
+    prev_indexed = None
     entries = []
     created = updated = closed_skips = failed = 0
 
@@ -979,7 +1030,8 @@ def sync_period(start, end, dry_run=False):
             "chat_id": member["chat_id"],
             "period": label,
             "actual": actual,
-            "target": float(LEDGER_TARGET_DEFAULT),
+            "target": float(LEDGER_BASE_TARGET),
+            "carry_in": 0.0,
             "remaining": None,
             "overtime": None,
             "closed": False,
@@ -994,7 +1046,8 @@ def sync_period(start, end, dry_run=False):
                 props = row["properties"]
                 entry.update(
                     actual=number_value(props["Actual Hours"]),
-                    target=target_or_default(props["Target"]),
+                    target=target_of(props),
+                    carry_in=number_value(props["Carry-in"]) or 0.0,
                     remaining=formula_number(props["Remaining"]),
                     overtime=formula_number(props["Overtime"]),
                     closed=True,
@@ -1016,8 +1069,21 @@ def sync_period(start, end, dry_run=False):
                 # downstream of a value this run did not store is estimated
                 # from the plain rule and flagged.
                 if row is not None:
-                    entry["target"] = target_or_default(row["properties"]["Target"])
+                    entry["target"] = target_of(row["properties"])
+                    entry["carry_in"] = (
+                        number_value(row["properties"]["Carry-in"]) or 0.0
+                    )
                 if row is None:
+                    # Carry-in is readable even here: it comes off the previous
+                    # period's row, which does exist. Only this row's own
+                    # formulas are out of reach, so the target is quoted as
+                    # the sum they would be given.
+                    if prev_indexed is None:
+                        prev_indexed = index_ledger(ledger_rows_for(prev_label))
+                    entry["carry_in"] = carry_out_of(
+                        prev_indexed.get((name, prev_label))
+                    )
+                    entry["target"] = LEDGER_BASE_TARGET + entry["carry_in"]
                     entry["action"] = "would create"
                     created += 1
                 elif stored_actual != actual:
@@ -1039,6 +1105,7 @@ def sync_period(start, end, dry_run=False):
                 print(
                     f"  {name:<10} actual {fmt_hours(actual):>5} / "
                     f"{fmt_hours(entry['target']):<4} "
+                    f"carry-in {fmt_hours(entry['carry_in']):>5}  "
                     f"left {fmt_hours(entry['remaining']):>5}  "
                     f"extra {fmt_hours(entry['overtime']):>5}  "
                     f"[{entry['action']}"
@@ -1051,6 +1118,14 @@ def sync_period(start, end, dry_run=False):
             if row is None:
                 # An untouched period must still be visible in the ledger, so
                 # a person with no tasks gets a row reading 0, not no row.
+                #
+                # This is the one moment Carry-in is written, so the previous
+                # period's Carry-out is read here and nowhere else. A person
+                # with no previous row — a new hire, or the first period the
+                # ledger ever ran — starts clean at 0.
+                if prev_indexed is None:
+                    prev_indexed = index_ledger(ledger_rows_for(prev_label))
+                carry_in = carry_out_of(prev_indexed.get((name, prev_label)))
                 created_row = ledger_write(
                     "POST",
                     "https://api.notion.com/v1/pages",
@@ -1060,7 +1135,8 @@ def sync_period(start, end, dry_run=False):
                         },
                         "Person": {"select": {"name": name}},
                         "Period": {"rich_text": [{"text": {"content": label}}]},
-                        "Target": {"number": LEDGER_TARGET_DEFAULT},
+                        "Base Target": {"number": LEDGER_BASE_TARGET},
+                        "Carry-in": {"number": carry_in},
                         "Actual Hours": {"number": actual},
                     },
                     extra={
@@ -1088,16 +1164,20 @@ def sync_period(start, end, dry_run=False):
                 updated += 1
 
             props = row["properties"]
-            entry["target"] = target_or_default(props["Target"])
+            entry["target"] = target_of(props)
+            entry["carry_in"] = number_value(props["Carry-in"]) or 0.0
             entry["remaining"] = formula_number(props["Remaining"])
             entry["overtime"] = formula_number(props["Overtime"])
             if entry["action"] != "unchanged":
                 # Every other job in this file logs the writes it makes; a
                 # ledger that moved someone's hours and said nothing would be
-                # the one place a wrong number has no trail.
+                # the one place a wrong number has no trail. The carry is on
+                # the line too: it is written once and never revisited, so the
+                # log is the only record of what this row was handed.
                 print(
                     f"LEDGER {entry['action'].upper()} {name} {label}: actual "
                     f"{fmt_hours(actual)}/{fmt_hours(entry['target'])}, "
+                    f"carry-in {fmt_hours(entry['carry_in'])}, "
                     f"left {fmt_hours(entry['remaining'])}, "
                     f"extra {fmt_hours(entry['overtime'])}"
                 )
@@ -1129,9 +1209,15 @@ def build_person_report(entry):
         f"📊 تقريرك | {html.escape(entry['period'])}",
         f"⏱️ ساعاتك: {fmt_hours(entry['actual'])} من {fmt_hours(entry['target'])}",
     ]
+    # Only shown when there is a carry, so an ordinary period reads the way it
+    # always did. The target above already includes it; this line says why it
+    # is not the plain 104.
+    carry_in = entry["carry_in"]
+    if carry_in and carry_in > 0:
+        lines.append(f"(منها {fmt_hours(carry_in)} مرحّلة من الفترة السابقة)")
     remaining = entry["remaining"]
     lines.append(
-        f"⚠️ ناقصك {fmt_hours(remaining)} ساعة"
+        f"⚠️ ناقصك {fmt_hours(remaining)} ساعة — تنتقل للفترة الجاية"
         if remaining is not None and remaining > 0
         else "✅ كملت الهدف"
     )
