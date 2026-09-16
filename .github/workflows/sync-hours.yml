@@ -1,0 +1,33 @@
+name: Sync Hours Ledger
+
+on:
+  schedule:
+    # Every 30 minutes. Cron is UTC — Baghdad is UTC+3.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log the changes without writing to Notion"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-hours
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync Actual Hours
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: python scripts/sync_hours.py
