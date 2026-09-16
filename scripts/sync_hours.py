@@ -55,7 +55,10 @@ EXCLUDED_STATUSES = ["cancelled"]
 # Only needed when a person's Notion display name does not start with the
 # ledger name (run `--list-users` to get the IDs).
 PERSON_OVERRIDES = {
-    # "1dcd872b-594c-8179-bacd-0002616ae7f1": "Zain",
+    "1dcd872b-594c-8179-bacd-0002616ae7f1": "Mohammed",
+    "3b9d872b-594c-8190-ae97-00025937a650": "Hussain",
+    "39cd872b-594c-8168-a854-0002237adfbf": "Zain",
+    "39cd872b-594c-814b-9baa-000296828401": "Saif",
 }
 
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() == "true"
