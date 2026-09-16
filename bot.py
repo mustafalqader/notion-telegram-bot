@@ -27,10 +27,10 @@ see main(). Each polling cycle:
    task, so each decision pings once and a changed decision pings again. This
    is the one place a client action reaches the main database, and it only
    ever sets Status.
-5. Hours ledger: hourly, sums the Hours formula over each person's tasks whose
-   Deadline falls in the current half-month period (the 1st to the 15th, or the
-   16th to the last day, Baghdad) and whose Status is Review, Approved or
-   cancelled, into the Hours Ledger database, one row per person per period,
+5. Hours ledger: every pass, sums the Hours formula over each person's tasks
+   whose Deadline falls in the current half-month period (the 1st to the 15th,
+   or the 16th to the last day, Baghdad) and whose Status is Review, Approved
+   or cancelled, into the Hours Ledger database, one row per person per period,
    keyed by Person + Period. New and In Progress count 0 until they move.
    Everyone gets a row even at zero hours, so an empty period is visible
    rather than missing. A new row carries in the previous period's Carry-out,
@@ -155,8 +155,6 @@ LEDGER_START = datetime(2026, 9, 16, tzinfo=BAGHDAD)
 # paid for once. Deliberately not persistence: a restarted run re-checks
 # against Notion, where Closed is the durable record.
 _closed_period = None
-# Monotonic mark of the last successful ledger pass; see main().
-_last_ledger_run = None
 # Both ledger jobs stay out of the polling loop until this is set. They write
 # to a live database and message five people, so switching them on is a
 # separate, deliberate act from deploying the code.
@@ -844,7 +842,7 @@ def base_target_for(person):
 
     Consulted at creation and nowhere else. An existing row's Base Target is
     never rewritten — it is a column edited by hand, and a lookup that
-    reasserted itself every hour would silently undo those edits the next
+    reasserted itself every pass would silently undo those edits the next
     time the bot ran.
     """
     return PERSON_TARGETS.get(person, LEDGER_BASE_TARGET)
@@ -1090,8 +1088,8 @@ def sync_period(start, end, dry_run=False):
     indexed = index_ledger(ledger_rows_for(label))
     # The previous period's rows, needed only to read Carry-out off them when
     # a row has to be created. Fetched at most once per pass, and not at all
-    # on the hourly passes that create nothing — which is all of them but the
-    # first of each period.
+    # on the passes that create nothing — which is all of them but the first
+    # of each period.
     prev_indexed = None
 
     def carry_in_for(person):
@@ -1554,7 +1552,6 @@ def parse_args(argv=None):
 
 def main():
     """Poll once, or keep polling every minute for LOOP_MINUTES minutes."""
-    global _last_ledger_run
     args = parse_args()
     if args.dry_run:
         preview(as_of=args.as_of)
@@ -1582,18 +1579,18 @@ def main():
                 print(f"ERROR {job.__name__} failed: {sanitize(exc)}", flush=True)
 
         if LEDGER_ENABLED:
-            # The ledger is hourly, not per-minute: its numbers move when a
-            # deadline or a task's hours change, not continuously, and every
-            # pass costs a handful of writes. A fresh process runs it once at
-            # startup, then on the hour. The marker only advances on success,
-            # so a Notion outage is retried next cycle rather than in an hour.
-            now_mono = time.monotonic()
-            if _last_ledger_run is None or now_mono - _last_ledger_run >= 3600:
-                try:
-                    run_ledger()
-                    _last_ledger_run = now_mono
-                except Exception as exc:
-                    print(f"ERROR run_ledger failed: {sanitize(exc)}", flush=True)
+            # Every pass, like every other job here. It used to be hourly, on
+            # the reasoning that the numbers only move when a deadline or a
+            # task's hours change and that each pass costs writes. The second
+            # half was wrong: sync_period writes only when Actual Hours
+            # actually differs, so a steady-state pass is two reads and no
+            # writes at all. An hour was buying nothing and costing an hour of
+            # staleness — a task moved to Review at 09:01 did not reach the
+            # ledger until 10:00.
+            try:
+                run_ledger()
+            except Exception as exc:
+                print(f"ERROR run_ledger failed: {sanitize(exc)}", flush=True)
             # Checked every cycle. Once the last period is closed it costs one
             # query and stops, so the report lands in the first minute a runner
             # is alive after the period ends — the 16th, or the 1st.
