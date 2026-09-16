@@ -48,8 +48,9 @@ LEDGER_DS = "729ea6ac-d3cf-49f7-9cd8-df82751119dc"
 TASKS_DB = "e94cbb20-1fd6-45a5-aa9a-1eaa51ac683f"
 LEDGER_DB = "a9cce9bb-aecb-41ef-baed-6dd5be4c9022"
 
-# Task statuses that earn no hours.
-EXCLUDED_STATUSES = ["cancelled"]
+# Task statuses that earn no hours. Approved, Review and cancelled all count;
+# cancelled counts because the editor has usually already done the work.
+EXCLUDED_STATUSES = ["New", "In Progress"]
 
 # Notion user ID -> Hours Ledger "Person" option.
 # Only needed when a person's Notion display name does not start with the
