@@ -29,12 +29,12 @@ see main(). Each polling cycle:
    ever sets Status.
 5. Hours ledger: hourly, sums the Hours formula over each person's tasks whose
    Deadline falls in the current half-month period (the 1st to the 15th, or the
-   16th to the last day, Baghdad) and whose Status is Review or Approved, into
-   the Hours Ledger database, one row per person per period, keyed by
-   Person + Period. New and In Progress tasks count 0 until they move. Everyone
-   gets a row even at zero hours, so an empty period is visible rather than
-   missing. A new row carries in the previous period's Carry-out, so a
-   shortfall follows a person into the next period and raises their Target;
+   16th to the last day, Baghdad) and whose Status is Review, Approved or
+   cancelled, into the Hours Ledger database, one row per person per period,
+   keyed by Person + Period. New and In Progress count 0 until they move.
+   Everyone gets a row even at zero hours, so an empty period is visible
+   rather than missing. A new row carries in the previous period's Carry-out,
+   so a shortfall follows a person into the next period and raises their Target;
    a surplus does not carry, because overtime is paid rather than banked.
    The bot writes Actual Hours, and Base Target (from PERSON_TARGETS, default
    104) and Carry-in once at creation — never again, since both are columns
@@ -127,7 +127,12 @@ LEDGER_FORMULA_PROPS = frozenset(
 # New or In Progress contributes 0 hours until it moves — it is not skipped or
 # flagged, it simply is not work yet. Compared case-folded because the database
 # mixes cases across its Status options ("Review", "cancelled").
-COUNTED_STATUSES = frozenset({"review", "approved"})
+#
+# cancelled is in the set on purpose. By the time a task is pulled the editor
+# has usually already done the work, so dropping those hours would dock them
+# for a decision that was not theirs. It is the one status here that counts
+# for work the client never received.
+COUNTED_STATUSES = frozenset({"review", "approved", "cancelled"})
 # Written to Base Target on create. The Target a person is actually judged
 # against is this plus whatever they carried in, and Notion computes that.
 LEDGER_BASE_TARGET = 104
@@ -969,18 +974,27 @@ def period_actuals(start, end):
     """{notion_user_id: hours} for one period, and the count of unreadable tasks.
 
     Sums the Hours formula over tasks whose Deadline falls in [start, end)
-    and whose Status is Review or Approved. Anything else — New, In Progress,
-    cancelled — contributes nothing, so a person's hours climb only as their
-    work reaches the client, and an untouched task in the period reads as 0
-    rather than as time already earned.
+    and whose Status is Review, Approved or cancelled. New and In Progress
+    contribute nothing, so a person's hours climb only as their work leaves
+    their hands, and an untouched task in the period reads as 0 rather than as
+    time already earned.
 
     The Notion filter is deliberately a day wider on each side and the real
     boundary is applied locally. Notion compares datetimes in UTC, so a filter
     written in Baghdad dates clips tasks near midnight at the edges of the
     period; fetching a little extra and bucketing here is exact.
 
-    Hours land on the *first* assignee, matching how job 1 decides who to
-    notify. A task shared between two people counts once, for its owner.
+    A shared task's hours are split evenly between its assignees, so two
+    people on one job take half each and the company-wide total still equals
+    the hours actually worked. This is the one place the ledger parts company
+    with job 1, which messages the first assignee and nobody else: who to tell
+    about a task and who earned it are different questions, and only the
+    second one is settled here.
+
+    A person outside TEAM_MAP — تصوير work, say — still takes their share, it
+    is simply never read back, because sync_period only looks up the people it
+    keeps rows for. Their share leaves with them rather than falling to whoever
+    they worked with.
     """
     tasks = query_data_source(
         DATA_SOURCE_ID,
@@ -1016,8 +1030,9 @@ def period_actuals(start, end):
         if hours is None:
             unreadable += 1
             continue
-        owner = people[0]["id"]
-        totals[owner] = totals.get(owner, 0.0) + hours
+        share = hours / len(people)
+        for person in people:
+            totals[person["id"]] = totals.get(person["id"], 0.0) + share
     return totals, unreadable
 
 
