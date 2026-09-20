@@ -28,9 +28,10 @@ see main(). Each polling cycle:
    is the one place a client action reaches the main database, and it only
    ever sets Status.
 5. Hours ledger: every pass, sums the Hours formula over each person's tasks
-   whose Deadline falls in the current half-month period (the 1st to the 15th,
-   or the 16th to the last day, Baghdad) and whose Status is Review, Approved
-   or cancelled, into the Hours Ledger database, one row per person per period,
+   whose counting date — Counting Date if set, otherwise Deadline — falls in
+   the current half-month period (the 1st to the 15th, or the 16th to the last
+   day, Baghdad) and whose Status is Review, Approved or cancelled, into the
+   Hours Ledger database, one row per person per period,
    keyed by Person + Period. New and In Progress count 0 until they move.
    Everyone gets a row even at zero hours, so an empty period is visible
    rather than missing. A new row carries in the previous period's Carry-out,
@@ -859,9 +860,11 @@ def period_is_live(end):
 
 
 def parse_deadline(prop):
-    """A Deadline as an aware Baghdad datetime, or None if unset/unparseable.
+    """A date property as an aware Baghdad datetime, or None if unset/unparseable.
 
-    Deadlines come in both shapes: a bare "2026-09-07" typed in the UI, and a
+    Used for both date columns the ledger reads, Deadline and Counting Date.
+
+    Dates come in both shapes: a bare "2026-09-07" typed in the UI, and a
     full "2026-09-07T14:00:00.000+03:00" when someone sets a time. A bare date
     is read as midnight *in Baghdad*, not UTC — otherwise a deadline on the
     16th would land in the previous period for three hours a day.
@@ -876,6 +879,29 @@ def parse_deadline(prop):
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(BAGHDAD)
     except ValueError:
         return None
+
+
+def period_moment(props):
+    """The date that decides which period a task counts in.
+
+    Counting Date when it is set, Deadline when it is not. This mirrors the
+    Period formula in Notion exactly, and it has to: if the two ever disagree
+    a task lands in one period here and a different one on the page, and the
+    ledger stops matching what people can see.
+
+    Counting Date exists for work whose deadline says the wrong thing about
+    when it was earned — delivered in one half-month against a deadline in the
+    next, or a deadline moved after the fact. Setting it moves the hours
+    without touching Deadline, which the bot has never written and still does
+    not.
+
+    A Counting Date that is set but unreadable falls through to Deadline
+    rather than dropping the task, on the same reasoning as carry_out_of: of
+    the two ways to be wrong, losing someone's hours is the worse one.
+    """
+    return parse_deadline(props.get("Counting Date") or {}) or parse_deadline(
+        props["Deadline"]
+    )
 
 
 def formula_number(prop):
@@ -971,7 +997,8 @@ def ledger_write(method, url, properties, extra=None):
 def period_actuals(start, end):
     """{notion_user_id: hours} for one period, and the count of unreadable tasks.
 
-    Sums the Hours formula over tasks whose Deadline falls in [start, end)
+    Sums the Hours formula over tasks whose counting date — Counting Date if
+    set, otherwise Deadline, see period_moment — falls in [start, end)
     and whose Status is Review, Approved or cancelled. New and In Progress
     contribute nothing, so a person's hours climb only as their work leaves
     their hands, and an untouched task in the period reads as 0 rather than as
@@ -994,19 +1021,36 @@ def period_actuals(start, end):
     keeps rows for. Their share leaves with them rather than falling to whoever
     they worked with.
     """
+    window_start = (start - timedelta(days=1)).date().isoformat()
+    window_end = (end + timedelta(days=1)).date().isoformat()
+
+    def within(prop):
+        """The two-sided window on one date column."""
+        return [
+            {"property": prop, "date": {"on_or_after": window_start}},
+            {"property": prop, "date": {"before": window_end}},
+        ]
+
+    # Either column can put a task in this period, so the query has to ask
+    # about both. Filtering on Deadline alone would silently lose exactly the
+    # tasks Counting Date exists for: one dated into this period but deadlined
+    # outside it would never be fetched, and no local check can rescue a row
+    # that was never returned.
     tasks = query_data_source(
         DATA_SOURCE_ID,
         {
-            "and": [
+            "or": [
+                # Counting Date wins when set, so its window alone decides —
+                # whatever Deadline says about this task does not matter.
+                {"and": within("Counting Date")},
+                # Deadline only gets a say when Counting Date is empty. The
+                # is_empty term is what keeps a task from being pulled back
+                # into the period its Counting Date moved it out of.
                 {
-                    "property": "Deadline",
-                    "date": {
-                        "on_or_after": (start - timedelta(days=1)).date().isoformat()
-                    },
-                },
-                {
-                    "property": "Deadline",
-                    "date": {"before": (end + timedelta(days=1)).date().isoformat()},
+                    "and": [
+                        {"property": "Counting Date", "date": {"is_empty": True}},
+                        *within("Deadline"),
+                    ]
                 },
             ]
         },
@@ -1018,7 +1062,7 @@ def period_actuals(start, end):
         props = page["properties"]
         if (select_name(props["Status"]) or "").strip().lower() not in COUNTED_STATUSES:
             continue
-        due = parse_deadline(props["Deadline"])
+        due = period_moment(props)
         if due is None or not (start <= due < end):
             continue
         people = props.get("Assignee", {}).get("people", [])
