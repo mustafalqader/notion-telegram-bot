@@ -39,9 +39,11 @@ see main(). Each polling cycle:
    a surplus does not carry, because overtime is paid rather than banked.
    The bot writes Actual Hours, and Base Target (from PERSON_TARGETS, default
    104) and Carry-in once at creation — never again, since both are columns
-   people edit by hand.
-   Target, Remaining, Overtime, Carry-out and التقدم are Notion's formulas and
-   are never written.
+   people edit by hand. It also writes Allocated Hours: the same sum as Actual
+   with the status test removed, so every task a person holds in the period
+   counts, New and In Progress included.
+   Target, Remaining, Overtime, Carry-out, التقدم and Hours to Assign are
+   Notion's formulas and are never written.
 6. Period close: when a period ends — the 16th, and the 1st of next month —
    refreshes the finished period's numbers, Telegrams each person their period
    and Mustafa all five in one message, then ticks Closed. It fires on the
@@ -120,9 +122,9 @@ NOTION_VERSION = "2025-09-03"
 LEDGER_DATA_SOURCE_ID = "729ea6ac-d3cf-49f7-9cd8-df82751119dc"
 # Computed by Notion. Never sent in a write. Target is among them now: it is
 # Base Target + Carry-in, so the bot writes those two operands and lets Notion
-# do the sum.
+# do the sum. Hours to Assign is the same arrangement for Allocated Hours.
 LEDGER_FORMULA_PROPS = frozenset(
-    {"Target", "Remaining", "Overtime", "Carry-out", "التقدم"}
+    {"Target", "Remaining", "Overtime", "Carry-out", "التقدم", "Hours to Assign"}
 )
 # Only work that reached the client counts toward the ledger. A task still in
 # New or In Progress contributes 0 hours until it moves — it is not skipped or
@@ -995,14 +997,20 @@ def ledger_write(method, url, properties, extra=None):
 
 
 def period_actuals(start, end):
-    """{notion_user_id: hours} for one period, and the count of unreadable tasks.
+    """Actual and Allocated hours for one period, and the unreadable count.
 
-    Sums the Hours formula over tasks whose counting date — Counting Date if
-    set, otherwise Deadline, see period_moment — falls in [start, end)
-    and whose Status is Review, Approved or cancelled. New and In Progress
-    contribute nothing, so a person's hours climb only as their work leaves
-    their hands, and an untouched task in the period reads as 0 rather than as
-    time already earned.
+    Returns ({notion_user_id: actual}, {notion_user_id: allocated}, unreadable).
+
+    Allocated is the same sum with the status test taken out: every task a
+    person holds in the period, New and In Progress included. Everything
+    below applies to both — the period rule, the split, the window.
+
+    Actual sums the Hours formula over tasks whose counting date — Counting
+    Date if set, otherwise Deadline, see period_moment — falls in
+    [start, end) and whose Status is Review, Approved or cancelled. New and In
+    Progress contribute nothing to Actual, so a person's hours climb only as
+    their work leaves their hands, and an untouched task in the period reads
+    as 0 rather than as time already earned.
 
     The Notion filter is deliberately a day wider on each side and the real
     boundary is applied locally. Notion compares datetimes in UTC, so a filter
@@ -1056,26 +1064,39 @@ def period_actuals(start, end):
         },
     )
 
-    totals = {}
+    actual = {}
+    allocated = {}
     unreadable = 0
     for page in tasks:
         props = page["properties"]
-        if (select_name(props["Status"]) or "").strip().lower() not in COUNTED_STATUSES:
-            continue
         due = period_moment(props)
         if due is None or not (start <= due < end):
             continue
         people = props.get("Assignee", {}).get("people", [])
         if not people:
             continue
+        # Status gates Actual and nothing else. Every task that survives the
+        # period and assignee checks lands in Allocated; only the counted ones
+        # land in Actual too. Both sums come off the same task, the same share
+        # and the same pass, so Actual can never exceed Allocated — it is a
+        # subset by construction, not by two loops happening to agree.
+        counted = (
+            select_name(props["Status"]) or ""
+        ).strip().lower() in COUNTED_STATUSES
         hours = formula_number(props["Hours"])
         if hours is None:
-            unreadable += 1
+            # Counted only for tasks that would have reached Actual, so the
+            # summary line means exactly what it meant before Allocated.
+            if counted:
+                unreadable += 1
             continue
         share = hours / len(people)
         for person in people:
-            totals[person["id"]] = totals.get(person["id"], 0.0) + share
-    return totals, unreadable
+            uid = person["id"]
+            allocated[uid] = allocated.get(uid, 0.0) + share
+            if counted:
+                actual[uid] = actual.get(uid, 0.0) + share
+    return actual, allocated, unreadable
 
 
 def ledger_rows_for(label):
@@ -1101,10 +1122,11 @@ def index_ledger(rows):
 def sync_period(start, end, dry_run=False):
     """Upsert every person's row for one period and return what each holds.
 
-    Writes three numbers and only these: Actual Hours on every pass, plus Base
-    Target and Carry-in at the moment a row is created. Target, Remaining,
-    Overtime, Carry-out and التقدم belong to Notion and are read back off the
-    row after the write, never recomputed.
+    Writes four numbers and only these: Actual Hours and Allocated Hours on
+    every pass that changes them, plus Base Target and Carry-in at the moment
+    a row is created. Target, Remaining, Overtime, Carry-out, التقدم and Hours
+    to Assign belong to Notion and are read back off the row after the write,
+    never recomputed.
 
     Carry-in is set once, at creation, from the previous period's Carry-out.
     It is deliberately not refreshed afterwards: the previous period is closed
@@ -1128,7 +1150,7 @@ def sync_period(start, end, dry_run=False):
     prev_start, prev_end = previous_period(start)
     prev_label = period_label(prev_start)
     prev_is_live = period_is_live(prev_end)
-    actuals, unreadable = period_actuals(start, end)
+    actuals, allocations, unreadable = period_actuals(start, end)
     indexed = index_ledger(ledger_rows_for(label))
     # The previous period's rows, needed only to read Carry-out off them when
     # a row has to be created. Fetched at most once per pass, and not at all
@@ -1153,15 +1175,34 @@ def sync_period(start, end, dry_run=False):
 
     entries = []
     created = updated = closed_skips = failed = 0
+    allocated_set = 0
 
     for name, member in TEAM_MAP.items():
         actual = round(actuals.get(member["notion_user_id"], 0.0), 2)
+        allocated = round(allocations.get(member["notion_user_id"], 0.0), 2)
+        if allocated < actual:
+            # Cannot happen while period_actuals builds Actual as a subset of
+            # Allocated. If it ever prints, that function has stopped doing so
+            # — a negative Hours value is the one way data alone could cause
+            # it — and both numbers for this person are suspect.
+            print(
+                f"LEDGER CHECK {name} {label}: allocated "
+                f"{fmt_hours(allocated)} < actual {fmt_hours(actual)} — "
+                "Actual should be a subset of Allocated",
+                flush=True,
+            )
         row = indexed.get((name, label))
         entry = {
             "name": name,
             "chat_id": member["chat_id"],
             "period": label,
             "actual": actual,
+            "allocated": allocated,
+            # Tracked apart from "action", which stays about Actual Hours and
+            # row creation exactly as before. Allocated Hours started empty on
+            # every row, so folding it in would have turned every line from
+            # "unchanged" to "would set" for a reason that is not Actual's.
+            "allocated_action": "unchanged",
             "target": float(base_target_for(name)),
             "carry_in": 0.0,
             "remaining": None,
@@ -1178,6 +1219,8 @@ def sync_period(start, end, dry_run=False):
                 props = row["properties"]
                 entry.update(
                     actual=number_value(props["Actual Hours"]),
+                    allocated=number_value(props.get("Allocated Hours")),
+                    allocated_action="closed",
                     target=target_of(props),
                     carry_in=number_value(props["Carry-in"]) or 0.0,
                     remaining=formula_number(props["Remaining"]),
@@ -1193,8 +1236,18 @@ def sync_period(start, end, dry_run=False):
             stored_actual = (
                 number_value(row["properties"]["Actual Hours"]) if row else None
             )
+            stored_allocated = (
+                number_value(row["properties"].get("Allocated Hours"))
+                if row
+                else None
+            )
 
             if dry_run:
+                if stored_allocated != allocated:
+                    entry["allocated_action"] = (
+                        f"would set {fmt_hours(stored_allocated)} -> "
+                        f"{fmt_hours(allocated)}"
+                    )
                 # Nothing is written, so Notion's formulas still describe the
                 # old Actual Hours. Quoting them as if they were the new
                 # numbers would be a preview of the wrong period, so anything
@@ -1239,6 +1292,8 @@ def sync_period(start, end, dry_run=False):
                     f"[{entry['action']}"
                     + ("; formulas estimated" if entry["estimated"] else "")
                     + "]"
+                    + f"  allocated {fmt_hours(allocated):>5} "
+                    + f"[{entry['allocated_action']}]"
                 )
                 entries.append(entry)
                 continue
@@ -1289,6 +1344,38 @@ def sync_period(start, end, dry_run=False):
                 entry["action"] = "updated"
                 updated += 1
 
+            # Allocated Hours is written on its own, after Actual has already
+            # been dealt with above, and inside its own guard. Batching it into
+            # Actual's write would let a problem with the new column — renamed,
+            # deleted, retyped — fail the whole request and cost this person
+            # their Actual Hours for the pass. Kept apart, the worst it can do
+            # is fail alone and say so.
+            #
+            # New rows are created without it, exactly as before, and pick it
+            # up here on the same pass. Nothing downstream reads a formula that
+            # depends on it, so there is no re-read.
+            if stored_allocated != allocated:
+                try:
+                    ledger_write(
+                        "PATCH",
+                        f"https://api.notion.com/v1/pages/{row['id']}",
+                        {"Allocated Hours": {"number": allocated}},
+                    )
+                    entry["allocated_action"] = (
+                        f"set {fmt_hours(stored_allocated)} -> "
+                        f"{fmt_hours(allocated)}"
+                    )
+                    allocated_set += 1
+                    print(
+                        f"LEDGER ALLOCATED {name} {label}: "
+                        f"{fmt_hours(stored_allocated)} -> {fmt_hours(allocated)}"
+                    )
+                except Exception as exc:
+                    print(
+                        f"LEDGER ERROR {name} {label} allocated: {sanitize(exc)}"
+                    )
+                    entry["allocated_action"] = "failed"
+
             props = row["properties"]
             entry["target"] = target_of(props)
             entry["carry_in"] = number_value(props["Carry-in"]) or 0.0
@@ -1318,6 +1405,7 @@ def sync_period(start, end, dry_run=False):
         f"Ledger{' (dry run)' if dry_run else ''}: {label}, "
         f"{created} created, {updated} updated, {closed_skips} closed, "
         f"{failed} failed"
+        + (f", {allocated_set} allocated set" if allocated_set else "")
         + (f", {unreadable} task(s) with unreadable Hours" if unreadable else ""),
         flush=True,
     )
