@@ -1,6 +1,6 @@
 """Notion -> Telegram notifier, portal sync, timestamps, decisions, hours ledger.
 
-Runs on a schedule (GitHub Actions). Six jobs are described below; three of
+Runs on a schedule (GitHub Actions). Seven jobs are described below; four of
 them run — job 3 is disabled and jobs 5 and 6 are gated behind LEDGER_ENABLED,
 see main(). Each polling cycle:
 
@@ -30,6 +30,16 @@ see main(). Each polling cycle:
    task, so each client decision pings once and a changed one pings again.
    This is the one place a client action reaches the main database, and it
    only ever sets Status.
+4b. Approval reconciliation: catch-up for a specific historical bug, where a
+    task the client had already approved never got its Status flipped
+    because the old code did not recognize the renamed "✅ مقبول". Flips
+    Status to Approved for a main task whose portal row currently reads
+    "✅ مقبول" *and* whose own Client Decision Notified already reads
+    "✅ مقبول" too — i.e. only backlog already announced in the past, never
+    a decision arriving this cycle (job 4 runs first and stamps Notified,
+    so a fresh decision cannot be mistaken for backlog). Sends no message —
+    the whole point is that these were already announced. Runs every cycle,
+    unconditionally, so this class of drift cannot silently reaccumulate.
 5. Hours ledger: every pass, sums the Hours formula over each person's tasks
    whose counting date — Counting Date if set, otherwise Deadline — falls in
    the current half-month period (the 1st to the 15th, or the 16th to the last
@@ -58,8 +68,8 @@ Both ledger jobs ignore every period ending before LEDGER_START, so the
 database's months of older work are never created, closed, reported or
 carried from. Sep 1-15 2026 is the first live period and carries in 0.
 
-Jobs 5 and 6 only run when LEDGER_ENABLED is set. Preview them against live
-data without writing or sending anything:
+Jobs 5 and 6 only run when LEDGER_ENABLED is set. Preview jobs 4b, 5 and 6
+against live data without writing or sending anything:
 
     python bot.py --dry-run
     python bot.py --dry-run --as-of 2026-09-16T09:30
@@ -820,6 +830,103 @@ def notify_client_decisions():
         f"{skipped} skipped, {failed} failed",
         flush=True,
     )
+
+
+# --------------------------------------------------------------------------
+# Job 4b: approval reconciliation (catch-up for a specific historical bug)
+# --------------------------------------------------------------------------
+
+def reconcile_stuck_approvals(dry_run=False):
+    """Flip Status to Approved on main tasks the client already approved but
+    that never got the flip, because of a real backlog this file created.
+
+    Before this file recognized the portal's renamed Client Decision options,
+    an unrecognized "✅ مقبول" fell into
+    notify_client_decisions's old "unknown option" fallback: that pinged
+    everyone and stamped Client Decision Notified, but only ever flipped
+    Status on a match against the then-current DECISION_APPROVED string —
+    which "✅ مقبول" was not. notify_client_decisions's
+    own dedup means those rows are stuck forever on the normal path: Notified
+    already reads "✅ مقبول", so the decision reads as
+    already handled and is never revisited there.
+
+    A row only qualifies when *both* the portal's live decision and the main
+    task's own Client Decision Notified already read DECISION_APPROVED, and
+    Status is not already Approved. This is deliberately narrower than "the
+    portal says approved" — a decision that arrived this same cycle has not
+    been stamped Notified yet (notify_client_decisions runs first and does
+    that), so it can never be mistaken for backlog and silently approved
+    without ever pinging anyone. Only backlog — decisions this file already
+    announced at some point in the past — ever matches.
+
+    Never sends a Telegram message, on purpose: every row this touches was
+    already announced, by definition of the condition above, so a message
+    here would just be a confusing repeat of one people already got, maybe
+    weeks later.
+
+    Runs every cycle, unconditionally, rather than as a one-off cleanup
+    script — so a future rename or bug that produces the same kind of stuck
+    row is closed automatically instead of requiring another by-hand pass.
+    """
+    rows = query_data_source(
+        PORTAL_DATA_SOURCE_ID,
+        {"property": "Client Decision", "select": {"equals": DECISION_APPROVED}},
+    )
+    candidates = []
+    failed = 0
+
+    for row in rows:
+        props = row["properties"]
+        row_label = title_text(props["Task Name"]) or row["id"]
+        try:
+            source_id = rich_text(props["Source ID"]).strip()
+            if not source_id:
+                continue
+            task = fetch_page(source_id)
+            if task is None:
+                continue
+            task_props = task["properties"]
+            if select_name(task_props["Status"]) == APPROVED_STATUS:
+                continue
+            state_prop = task_props.get(DECISION_STATE_PROP)
+            if state_prop is None or rich_text(state_prop).strip() != DECISION_APPROVED:
+                # Not backlog: either not notified yet this cycle (
+                # notify_client_decisions will handle it) or notified about a
+                # different decision. Either way, not this job's problem.
+                continue
+            candidates.append((task, row_label))
+        except Exception as exc:  # one bad row must never kill the pass
+            print(f"RECONCILE ERROR '{row_label}': {sanitize(exc)}")
+            failed += 1
+
+    flipped = 0
+    for task, row_label in candidates:
+        task_name = title_text(task["properties"]["Task Name"]) or row_label
+        current_status = select_name(task["properties"]["Status"])
+        if dry_run:
+            print(
+                f"RECONCILE WOULD FLIP '{task_name}': "
+                f"{current_status} -> {APPROVED_STATUS}"
+            )
+            continue
+        try:
+            notion_write(
+                "PATCH",
+                f"https://api.notion.com/v1/pages/{task['id']}",
+                {"properties": {"Status": {"select": {"name": APPROVED_STATUS}}}},
+            )
+            print(f"RECONCILE FLIPPED '{task_name}': {current_status} -> {APPROVED_STATUS}")
+            flipped += 1
+        except Exception as exc:
+            print(f"RECONCILE ERROR '{task_name}': {sanitize(exc)}")
+            failed += 1
+
+    print(
+        f"Reconcile{' (dry run)' if dry_run else ''}: {len(candidates)} stuck "
+        f"approval(s) found, {flipped} flipped, {failed} failed",
+        flush=True,
+    )
+    return candidates
 
 
 # --------------------------------------------------------------------------
@@ -1651,7 +1758,7 @@ def run_once():
 
 
 def preview(as_of=None):
-    """One no-write pass over jobs 5 and 6, printing what they would do.
+    """One no-write pass over jobs 4b, 5 and 6, printing what they would do.
 
     Reads the live databases — the numbers below are real — but takes no write
     path and sends no message. A row that does not exist yet cannot show true
@@ -1664,6 +1771,8 @@ def preview(as_of=None):
         f"DRY RUN at {now:%Y-%m-%d %H:%M %Z} — current period is "
         f"{period_label(start)}. Nothing is written or sent.\n"
     )
+    reconcile_stuck_approvals(dry_run=True)
+    print()
     run_ledger(now=now, dry_run=True)
     print()
     # There is always a previous period, so the close is always "due"; whether
@@ -1680,7 +1789,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview jobs 5 and 6 against live data without writing or sending.",
+        help="Preview jobs 4b, 5 and 6 against live data without writing or "
+        "sending.",
     )
     parser.add_argument(
         "--as-of",
@@ -1728,7 +1838,12 @@ def main():
         # re-add it here to switch it back on. Until then "Approved At" is
         # filled in by hand, and the bot leaves any value already present
         # alone.
-        for job in (run_once, sync_portal, notify_client_decisions):
+        for job in (
+            run_once,
+            sync_portal,
+            notify_client_decisions,
+            reconcile_stuck_approvals,
+        ):
             try:
                 job()
             except Exception as exc:  # e.g. Notion outage — keep the loop alive
