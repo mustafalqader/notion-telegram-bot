@@ -23,10 +23,13 @@ see main(). Each polling cycle:
    are maintained by hand meanwhile.
 4. Client decisions: reads "Client Decision" from portal rows and Telegrams
    the main task's assignee *and* Mustafa when it changes, approving the main
-   task on "✅ Approved". The decision last pinged about is stored on the main
-   task, so each decision pings once and a changed decision pings again. This
-   is the one place a client action reaches the main database, and it only
-   ever sets Status.
+   task on "✅ مقبول". "🔁 يحتاج تعديل" pings the same way but never touches
+   Status. "✏️ تم التعديل" is set by the iPlugn team, not the client, so it is
+   ignored entirely — no message, no state, no Status change; see
+   CLIENT_DECISIONS. The decision last pinged about is stored on the main
+   task, so each client decision pings once and a changed one pings again.
+   This is the one place a client action reaches the main database, and it
+   only ever sets Status.
 5. Hours ledger: every pass, sums the Hours formula over each person's tasks
    whose counting date — Counting Date if set, otherwise Deadline — falls in
    the current half-month period (the 1st to the 15th, or the 16th to the last
@@ -107,8 +110,16 @@ APPROVED_STATUS = "Approved"
 STAMP_EPOCH = datetime(2026, 8, 5, tzinfo=BAGHDAD)
 
 # Client decision handling (job 4)
-DECISION_APPROVED = "✅ Approved"
-DECISION_CHANGES = "🔁 Needs Changes"
+DECISION_APPROVED = "✅ مقبول"
+DECISION_CHANGES = "🔁 يحتاج تعديل"
+# Set by the iPlugn team on the portal row, not by the client — an editor
+# marking their own revision as done. Never notifies and never touches the
+# main task's Status; it exists only so the option is legal to pick.
+DECISION_EDITED = "✏️ تم التعديل"
+# The only two values that are a client speaking. Everything else — the
+# iPlugn-only DECISION_EDITED, or any future option this code predates —
+# is left alone: no message, no state write, no Status change.
+CLIENT_DECISIONS = frozenset({DECISION_APPROVED, DECISION_CHANGES})
 # Which decision we last pinged about, kept on the MAIN task. Storing it in
 # Notion rather than on disk is what makes the ping survive between runs:
 # every GitHub Actions run starts with an empty filesystem.
@@ -615,14 +626,13 @@ def fetch_page(page_id):
 
 
 def build_decision_message(decision, task_name, assignee_name, comment, task_url):
+    # Only ever called with a value from CLIENT_DECISIONS — see the skip in
+    # notify_client_decisions — so there is no "unknown option" branch here
+    # to fall back on. A decision this code predates simply does not notify.
     if decision == DECISION_APPROVED:
         header = "✅ الميادين وافقت | Client Approved"
-    elif decision == DECISION_CHANGES:
-        header = "🔁 الميادين تطلب تعديلات | Changes Requested"
     else:
-        # An option added in Notion that this code predates. Still worth a
-        # ping — losing the signal is worse than an unstyled message.
-        header = f"📣 قرار جديد من الميادين | {html.escape(decision)}"
+        header = "🔁 الميادين تطلب تعديلات | Changes Requested"
 
     lines = [header, f"📌 {html.escape(task_name)}"]
     # These messages now land in more than one inbox, so name the owner: the
@@ -690,6 +700,20 @@ def notify_client_decisions():
         row_label = title_text(props["Task Name"]) or row["id"]
         try:
             decision = select_name(props["Client Decision"])
+            if decision not in CLIENT_DECISIONS:
+                # DECISION_EDITED (iPlugn marking their own revision done) or
+                # any future option this code predates — not a client action,
+                # so no message, no state write, no Status change. Nothing to
+                # retry either: there is no "notified" state for this value to
+                # reach, so this prints every cycle the row sits here, which is
+                # fine — it costs a log line, not a duplicate anything.
+                print(
+                    f"DECISION SKIP '{row_label}': '{decision}' is not a "
+                    "client decision — ignored"
+                )
+                skipped += 1
+                continue
+
             source_id = rich_text(props["Source ID"]).strip()
             if not source_id:
                 print(f"DECISION SKIP '{row_label}': portal row has no Source ID")
@@ -710,8 +734,8 @@ def notify_client_decisions():
                 )
 
             # Compare against the decision we last pinged about, not a simple
-            # "seen" flag: if the client switches from Needs Changes to
-            # Approved, the stored value no longer matches and it pings again.
+            # "seen" flag: if the client switches from يحتاج تعديل to مقبول,
+            # the stored value no longer matches and it pings again.
             #
             # This skip used to be the one silent path in the job, which made
             # "2 skipped" indistinguishable from a missing Source ID or a
