@@ -1,6 +1,6 @@
 """Notion -> Telegram notifier, portal sync, timestamps, decisions, hours ledger.
 
-Runs on a schedule (GitHub Actions). Seven jobs are described below; four of
+Runs on a schedule (GitHub Actions). Eight jobs are described below; five of
 them run — job 3 is disabled and jobs 5 and 6 are gated behind LEDGER_ENABLED,
 see main(). Each polling cycle:
 
@@ -63,12 +63,25 @@ see main(). Each polling cycle:
    condition "last period still has an open row", not on a clock instant, and
    it sends before it closes so a failed send is retried rather than buried.
    Closed rows are never touched again by either ledger job.
+7. Client comments: reads the page comments on portal rows and Telegrams the
+   main task's assignee and Mustafa — job 4's recipients — for every comment
+   whose author is not in TEAM_MAP. Thread replies count: Notion returns them
+   in the same flat list, and a client's reply is as much a client comment as
+   the one that opened the thread. Only comments created on or after
+   COMMENT_EPOCH are ever sent, and each one's id is recorded on the main task
+   in COMMENT_STATE_PROP so it is sent exactly once.
+   Independent of job 4 by design: a client who picks "🔁 يحتاج تعديل" and
+   then explains why in a comment has done two things, and both should arrive.
+   Neither job reads the other's state, so their order does not matter.
+   Reading comments is its own Notion capability. Without it every request
+   comes back 403, and the job says so once and returns, leaving every other
+   job running.
 
 Both ledger jobs ignore every period ending before LEDGER_START, so the
 database's months of older work are never created, closed, reported or
 carried from. Sep 1-15 2026 is the first live period and carries in 0.
 
-Jobs 5 and 6 only run when LEDGER_ENABLED is set. Preview jobs 4b, 5 and 6
+Jobs 5 and 6 only run when LEDGER_ENABLED is set. Preview jobs 4b, 7, 5 and 6
 against live data without writing or sending anything:
 
     python bot.py --dry-run
@@ -138,6 +151,33 @@ DECISION_STATE_PROP = "Client Decision Notified"
 # copied on every decision whether or not he owns the task.
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "7469972624"))
 NOTION_VERSION = "2025-09-03"
+
+# Job 7: client comments on portal pages
+# Which comment ids have already been forwarded, space-separated and undashed,
+# kept on the MAIN task for the same reason as DECISION_STATE_PROP: a fresh
+# Actions run has an empty filesystem, and the portal is the client's database
+# — bot bookkeeping does not belong in a column they can see.
+COMMENT_STATE_PROP = "Client Comments Notified"
+# Comments older than this are never forwarded, not even on a first run. The
+# portal carries months of client chatter about work long since delivered, and
+# forwarding all of it would Telegram five people about closed conversations.
+# A Baghdad midnight, like every other cutoff in this file.
+COMMENT_EPOCH = datetime(2026, 9, 24, tzinfo=BAGHDAD)
+# Reading one page's comments costs one request, and there are ~52 portal
+# pages against a ~3 req/s budget shared with every other job. Pages whose
+# Client Decision is anything other than approved are still being talked
+# about, so they are read every pass; approved pages are swept round-robin,
+# this many per pass, which keeps the per-pass cost flat as the portal grows.
+COMMENT_APPROVED_BATCH = 10
+# Where the round-robin sweep resumes. Process-local on purpose: a fresh run
+# starting from the top re-reads a few pages it need not have, which costs
+# requests and never a duplicate message, because the state that prevents
+# those lives in Notion.
+_comment_cursor = 0
+# A rich_text value caps at 2000 characters. An undashed id plus a separator
+# is 33, so this holds about 57 comments for one task — far more than any task
+# has had. Kept below the hard limit so a write never fails on length.
+COMMENT_STATE_MAX_CHARS = 1900
 
 # Half-month hours ledger (jobs 5 and 6)
 LEDGER_DATA_SOURCE_ID = "729ea6ac-d3cf-49f7-9cd8-df82751119dc"
@@ -927,6 +967,338 @@ def reconcile_stuck_approvals(dry_run=False):
         flush=True,
     )
     return candidates
+
+
+# --------------------------------------------------------------------------
+# Job 7: client comments on portal pages, forwarded to Telegram
+# --------------------------------------------------------------------------
+
+class CommentsUnavailable(RuntimeError):
+    """The integration cannot read comments at all.
+
+    A capability rather than a transient failure: the token is missing
+    Notion's "Read comments" permission, and no retry fixes that. Its own
+    class so the job can say so once and stop asking fifty more times.
+    """
+
+
+def fetch_page_comments(page_id):
+    """Every comment on a page, oldest first, replies included.
+
+    Notion returns one flat list across all of the page's discussion threads,
+    so a reply arrives as another comment carrying the same discussion_id.
+    That is exactly what this job wants — a client's reply is as much a client
+    comment as the one that opened the thread — so nothing here needs to
+    reconstruct the thread shape.
+    """
+    params = {"block_id": page_id, "page_size": 100}
+    results = []
+    while True:
+        resp = requests.get(
+            "https://api.notion.com/v1/comments",
+            headers=NOTION_HEADERS,
+            params=params,
+            timeout=30,
+        )
+        if resp.status_code in (401, 403):
+            # Notion answers a token without the "Read comments" capability
+            # with 403, and that is indistinguishable per-page from a token
+            # that cannot read this one page — so treat it as the capability
+            # being absent and let the caller stop the sweep.
+            raise CommentsUnavailable(
+                f"Notion {resp.status_code} reading comments: {resp.text[:300]}"
+            )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Notion {resp.status_code} reading comments for {page_id}: "
+                f"{resp.text[:300]}"
+            )
+        data = resp.json()
+        results.extend(data["results"])
+        if not data.get("has_more"):
+            return results
+        params["start_cursor"] = data["next_cursor"]
+
+
+def comment_is_recent(comment):
+    """True if a comment was created on or after COMMENT_EPOCH.
+
+    Fails closed, like created_after_epoch: a comment with no readable
+    created_time is treated as old and left alone. Being wrong in the strict
+    direction costs one missed forward that a person can still see in Notion;
+    being wrong the other way messages five people about months of settled
+    conversation.
+    """
+    raw = comment.get("created_time")
+    if not raw:
+        return False
+    try:
+        created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return created >= COMMENT_EPOCH
+
+
+# notion_user_id -> display name, for authors outside TEAM_MAP. Cached for the
+# life of the process: the client side is a handful of people who comment
+# often, so this is one request each and then never again.
+_author_names = {}
+
+
+def author_label(user):
+    """A display name for a comment's author, or None if Notion will not say.
+
+    created_by on a comment is a partial user object, usually just an id, so
+    the name normally costs one request. Best effort throughout: the author
+    line is a courtesy on the message, and a failed lookup must never be what
+    stops a client comment reaching anyone.
+    """
+    name = (user or {}).get("name")
+    if name:
+        return name
+    user_id = (user or {}).get("id")
+    if not user_id:
+        return None
+    if user_id not in _author_names:
+        label = None
+        try:
+            resp = requests.get(
+                f"https://api.notion.com/v1/users/{user_id}",
+                headers=NOTION_HEADERS,
+                timeout=30,
+            )
+            if resp.status_code < 400:
+                label = resp.json().get("name")
+        except Exception:
+            label = None
+        _author_names[user_id] = label
+    return _author_names[user_id]
+
+
+def build_comment_message(task_name, author, text, page_url):
+    lines = ["💬 تعليق من الميادين | Client Comment", f"📌 {html.escape(task_name)}"]
+    # Omitted rather than shown as a raw id when Notion will not name the
+    # author: a UUID tells the reader less than no line at all.
+    if author:
+        lines.append(f"✍️ {html.escape(author)}")
+    if text:
+        lines.append(html.escape(text))
+    # The portal page, not the main task: the comment lives there, and that is
+    # where someone goes to read the rest of the thread and answer it.
+    lines.append(f"🔗 {page_url}")
+    return "\n".join(lines)
+
+
+def comment_sweep(rows):
+    """The portal pages to read this pass, and a note for the log.
+
+    Everything still under discussion — any Client Decision that is not
+    approved, including rows the client has not answered yet — is read every
+    pass, because that is where comments actually arrive. Approved pages are
+    swept round-robin so a late comment on settled work is still found, within
+    one full cycle rather than immediately.
+
+    Sorted by id so the cycle is stable: Notion does not promise query order,
+    and an order that shuffled between passes would let a page slip past the
+    window over and over.
+    """
+    global _comment_cursor
+    open_rows = []
+    approved = []
+    for row in rows:
+        if select_name(row["properties"]["Client Decision"]) == DECISION_APPROVED:
+            approved.append(row)
+        else:
+            open_rows.append(row)
+    approved.sort(key=lambda row: row["id"])
+
+    window = []
+    if approved:
+        start = _comment_cursor % len(approved)
+        take = min(COMMENT_APPROVED_BATCH, len(approved))
+        window = [approved[(start + i) % len(approved)] for i in range(take)]
+        _comment_cursor = (start + take) % len(approved)
+
+    note = (
+        f"{len(open_rows)} open + {len(window)} of {len(approved)} approved"
+    )
+    return open_rows + window, note
+
+
+def notify_client_comments(dry_run=False):
+    """Job 7: forward the client's portal comments to Telegram.
+
+    A comment is forwarded when its author is not in TEAM_MAP, it was created
+    on or after COMMENT_EPOCH, and its id is not already recorded on the main
+    task. Recipients are job 4's: the main task's assignee and Mustafa.
+
+    Deliberately independent of job 4. A client who sets "🔁 يحتاج تعديل" and
+    then explains themselves in a comment has done two things, and the team
+    should hear both; neither job looks at the other's state, so the order
+    they happen in does not matter.
+
+    Send first, record second, one comment at a time — the same trade job 4
+    makes. A crash between the two re-forwards one comment next pass, and a
+    duplicate message is a better failure than a client comment nobody sees.
+    """
+    try:
+        rows = query_data_source(PORTAL_DATA_SOURCE_ID)
+    except Exception as exc:
+        print(f"COMMENTS ERROR listing portal rows: {sanitize(exc)}", flush=True)
+        return
+
+    pages, sweep_note = comment_sweep(rows)
+    checked = sent = skipped = failed = 0
+
+    for row in pages:
+        row_label = title_text(row["properties"]["Task Name"]) or row["id"]
+        try:
+            comments = fetch_page_comments(row["id"])
+            checked += 1
+
+            # Team comments never travel, the client's own older ones never
+            # travel, and this runs before the main task is fetched so a page
+            # with nothing new costs exactly one request.
+            fresh = [
+                comment
+                for comment in comments
+                if (comment.get("created_by") or {}).get("id") not in USER_LOOKUP
+                and comment_is_recent(comment)
+            ]
+            if not fresh:
+                continue
+
+            source_id = rich_text(row["properties"]["Source ID"]).strip()
+            if not source_id:
+                print(
+                    f"COMMENT SKIP '{row_label}': {len(fresh)} client "
+                    "comment(s) but the portal row has no Source ID, so there "
+                    "is no main task to notify or to record against"
+                )
+                skipped += 1
+                continue
+
+            task = fetch_page(source_id)
+            if task is None:
+                print(f"COMMENT SKIP '{row_label}': main task {source_id} is gone")
+                skipped += 1
+                continue
+
+            state_prop = task["properties"].get(COMMENT_STATE_PROP)
+            if state_prop is None:
+                raise RuntimeError(
+                    f'main database is missing the "{COMMENT_STATE_PROP}" '
+                    "text property; add it so comments can be tracked"
+                )
+            # Order is preserved, oldest first, because the length guard below
+            # drops from the front.
+            recorded = rich_text(state_prop).split()
+            already = set(recorded)
+            pending = [
+                comment
+                for comment in fresh
+                if normalize_id(comment["id"]) not in already
+            ]
+            if not pending:
+                continue
+
+            task_name = title_text(task["properties"]["Task Name"]) or row_label
+            assignee_name, chat_ids = decision_recipients(task, row_label)
+            newly_sent = []
+
+            for comment in pending:
+                text = rich_text(comment).strip()
+                author = author_label(comment.get("created_by"))
+                if dry_run:
+                    print(
+                        f"COMMENT WOULD SEND '{task_name}'\n"
+                        f"    from: {author or 'unnamed'} at "
+                        f"{comment.get('created_time')}\n"
+                        f"    to:   {assignee_name or 'no assignee'} "
+                        f"+ owner {chat_ids}\n"
+                        f"    text: {text[:300]}"
+                    )
+                    sent += 1
+                    continue
+
+                message = build_comment_message(
+                    task_name, author, text, row["url"]
+                )
+                # Per recipient, so a teammate who never opened the bot chat
+                # cannot block the others or hold the state write hostage —
+                # job 4's reasoning, and the same conclusion.
+                delivered = []
+                for chat_id in chat_ids:
+                    try:
+                        send_telegram(chat_id, message)
+                        delivered.append(chat_id)
+                    except Exception as exc:
+                        print(
+                            f"COMMENT ERROR '{task_name}' -> {chat_id}: "
+                            f"{sanitize(exc)}"
+                        )
+                if not delivered:
+                    # Left unrecorded on purpose so the next pass retries it.
+                    print(
+                        f"COMMENT FAILED '{task_name}': no recipient reached, "
+                        f"leaving {comment['id']} unrecorded"
+                    )
+                    failed += 1
+                    continue
+
+                newly_sent.append(normalize_id(comment["id"]))
+                print(
+                    f"COMMENT SENT '{task_name}' from {author or 'unnamed'} -> "
+                    f"{len(delivered)}/{len(chat_ids)} recipients {delivered}"
+                )
+                sent += 1
+
+            # One write per task rather than one per comment, and only for the
+            # comments that actually went out.
+            if newly_sent:
+                recorded.extend(newly_sent)
+                while len(" ".join(recorded)) > COMMENT_STATE_MAX_CHARS:
+                    dropped = recorded.pop(0)
+                    print(
+                        f"COMMENT STATE FULL '{task_name}': dropped oldest id "
+                        f"{dropped} to stay inside the property's length "
+                        "limit — that comment could be forwarded again"
+                    )
+                notion_write(
+                    "PATCH",
+                    f"https://api.notion.com/v1/pages/{task['id']}",
+                    {
+                        "properties": {
+                            COMMENT_STATE_PROP: {
+                                "rich_text": [
+                                    {"text": {"content": " ".join(recorded)}}
+                                ]
+                            }
+                        }
+                    },
+                )
+        except CommentsUnavailable as exc:
+            # The whole sweep is pointless without the capability, so stop
+            # here instead of collecting the same 403 fifty more times. Every
+            # other job carries on: main() calls this one inside its own try.
+            print(
+                "COMMENTS UNAVAILABLE: this integration cannot read comments. "
+                'Add the "Read comments" capability to the integration in '
+                "Notion (Settings -> Connections -> the integration -> "
+                f"Capabilities). Job 7 is doing nothing until then. {sanitize(exc)}",
+                flush=True,
+            )
+            return
+        except Exception as exc:  # one bad page must never kill the sweep
+            print(f"COMMENT ERROR '{row_label}': {sanitize(exc)}")
+            failed += 1
+
+    print(
+        f"Comments{' (dry run)' if dry_run else ''}: {sweep_note}, "
+        f"{checked} page(s) read, {sent} forwarded, {skipped} skipped, "
+        f"{failed} failed",
+        flush=True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1758,7 +2130,7 @@ def run_once():
 
 
 def preview(as_of=None):
-    """One no-write pass over jobs 4b, 5 and 6, printing what they would do.
+    """One no-write pass over jobs 4b, 7, 5 and 6, printing what they would do.
 
     Reads the live databases — the numbers below are real — but takes no write
     path and sends no message. A row that does not exist yet cannot show true
@@ -1773,6 +2145,8 @@ def preview(as_of=None):
     )
     reconcile_stuck_approvals(dry_run=True)
     print()
+    notify_client_comments(dry_run=True)
+    print()
     run_ledger(now=now, dry_run=True)
     print()
     # There is always a previous period, so the close is always "due"; whether
@@ -1784,13 +2158,14 @@ def preview(as_of=None):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Notion -> Telegram notifier. With no arguments it runs "
-        "the polling loop; --dry-run previews the hours ledger."
+        "the polling loop; --dry-run previews the hours ledger and the "
+        "client comments that would be forwarded."
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview jobs 4b, 5 and 6 against live data without writing or "
-        "sending.",
+        help="Preview jobs 4b, 7, 5 and 6 against live data without writing "
+        "or sending.",
     )
     parser.add_argument(
         "--as-of",
@@ -1843,6 +2218,7 @@ def main():
             sync_portal,
             notify_client_decisions,
             reconcile_stuck_approvals,
+            notify_client_comments,
         ):
             try:
                 job()
